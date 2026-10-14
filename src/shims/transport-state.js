@@ -26,7 +26,17 @@ function normalizeProxy(proxy) {
     throw new Error(`代理配置不完整：host=${host || '(空)'} port=${proxy.port}`);
   }
   const kind = String(proxy.kind || 'socks5').toLowerCase();
+  // 这里只管「自研隧道」那三种。MTProxy 不走这套：
+  // 它是 GramJS 自带的 ConnectionTCPMTProxyAbridged，靠 clientParams.proxy 传入，
+  // 如果它被写进这里，net.js 会把「连代理服务器」这个动作本身再套一层隧道，
+  // 变成连代理的代理，必然失败。所以宁可在这里明确报错，也不要静默放行。
   if (!['socks5', 'socks4', 'http'].includes(kind)) {
+    if (kind === 'mtproxy') {
+      throw new Error('MTProxy 不走隧道实现，应由 GramJS 的 TCPMTProxy 连接处理');
+    }
+    if (kind === 'web') {
+      throw new Error('WEB 代理需要私有 WebView 环境，本客户端不支持');
+    }
     throw new Error(`不支持的代理类型：${proxy.kind}`);
   }
   return {

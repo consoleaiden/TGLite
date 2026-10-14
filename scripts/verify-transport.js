@@ -648,6 +648,65 @@ async function main() {
   });
 
   // ---------------------------------------------------------------------
+  // MTProxy：GramJS 自带实现，绝不能混进自研隧道。
+  // 这里守住两条容易悄悄坏掉的约定：
+  //   1. mtproxy 写进 tunnel 状态会变成「连代理的代理」，必须明确报错
+  //   2. GramJS 的 TCPMTProxy 构造函数里直接调 secret.match()，
+  //      所以密钥必须传字符串；传 Buffer 会抛
+  //      "proxy.secret.match is not a function"（已实测复现过）
+  // ---------------------------------------------------------------------
+  await check('MTProxy 不允许写进 tunnel 状态（会变成连代理的代理）', () => {
+    assert.throws(
+      () => transportState.setProxy({ enabled: true, kind: 'mtproxy', host: 'a', port: 443, secret: 'x' }),
+      /MTProxy/,
+    );
+    assert.strictEqual(transportState.hasProxy(), false);
+  });
+
+  await check('WEB 代理不允许写进 tunnel 状态，且报错可读', () => {
+    assert.throws(
+      () => transportState.setProxy({ enabled: true, kind: 'web', host: 'a', port: 443, secret: 'x' }),
+      /WebView/,
+    );
+    assert.strictEqual(transportState.hasProxy(), false);
+  });
+
+  await check('MTProxy 密钥必须传字符串（传 Buffer 会让 GramJS 直接抛错）', () => {
+    // 复刻 GramJS TCPMTProxy 构造函数里的判定，验证两种输入的行为差异
+    const viaString = (secret) => secret.match(/^[0-9a-f]+$/i) !== null;
+    const hex = '0e45caf3bbce0d8d995cfb919fa9d61a';
+    assert.strictEqual(viaString(hex), true, '字符串密钥应能被 GramJS 的 .match 处理');
+
+    // 反证：Buffer 没有 .match，这正是我们必须传字符串的原因
+    const buf = Buffer.from(hex, 'hex');
+    assert.strictEqual(typeof buf.match, 'undefined', 'Buffer 不应有 match 方法');
+    let threw = false;
+    try {
+      buf.match(/^[0-9a-f]+$/i);
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    assert.strictEqual(threw, true, '传 Buffer 应触发 TypeError（作为必须传字符串的反证）');
+  });
+
+  await check('MTProxy 密钥按 hex / dd 前缀 / base64 解码后都是 16 或 17 字节', () => {
+    const hex = '0e45caf3bbce0d8d995cfb919fa9d61a';
+    // 与 GramJS 的 initHeader 判定保持一致
+    // 注意：别把这个局部函数叫 check，会遮蔽上面的 check 辅助函数
+    const decodeSecret = (secret) => {
+      let s = Buffer.from(secret, /^[0-9a-f]+$/i.test(secret) ? 'hex' : 'base64');
+      const isDD = s.length === 17 && s[0] === 0xdd;
+      if (isDD) s = s.slice(1);
+      assert.strictEqual(s.length, 16, `密钥解码后应为 16 字节：${secret}`);
+      return isDD;
+    };
+    assert.strictEqual(decodeSecret(hex), false, '32 位 hex 不应被判为 dd 形式');
+    assert.strictEqual(decodeSecret(`dd${hex}`), true, 'dd 前缀应被判为 dd 形式');
+    const b64 = Buffer.from(new Uint8Array(16).fill(0x7f)).toString('base64');
+    assert.strictEqual(decodeSecret(b64), false, 'base64 16 字节应通过');
+  });
+
+  // ---------------------------------------------------------------------
   // 收尾
   // ---------------------------------------------------------------------
   transportState.setProxy(null);

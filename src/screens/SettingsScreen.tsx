@@ -8,7 +8,11 @@ import { APP_NAME, APP_VERSION } from '../config';
 import { splitKeywords } from '../filters';
 import type { RootStackParamList } from '../navigation';
 import { proxyActuallyInUse, transportLabel } from '../net/transport';
-import { useSettingsStore } from '../settings';
+import {
+  useSettingsStore,
+  describeProxyTarget,
+  proxyKindLabel,
+} from '../settings';
 import { useAppStore } from '../store';
 import { detachRealtime } from '../boot';
 import { getCredentials, humanizeAuthError, logout } from '../tg/telegram';
@@ -103,7 +107,7 @@ export default function SettingsScreen({ navigation }: Props) {
           label="代理"
           value={
             proxy.enabled
-              ? `${proxy.kind.toUpperCase()} ${proxy.host || '(未填地址)'}:${proxy.port || '-'}${
+              ? `${proxyKindLabel(proxy.kind)} ${describeProxyTarget(proxy)}${
                   proxyActuallyInUse() ? '' : ' · 当前未生效'
                 }`
               : '未启用'

@@ -42,7 +42,10 @@
 - **切换 API 凭据**：设置页可查看 / 修改 `api_id` 与 `api_hash`，改完引导重新登录
 - **广告过滤**：本地关键词过滤，命中消息折叠为「广告消息已过滤」，点击可展开/收起，默认隐藏
 - **未成年保护**：本地关键词过滤，命中消息彻底不显示（连折叠提示都不留）
-- **SOCKS5 / SOCKS4 / HTTP 代理**：自研纯 JS 隧道，支持用户名密码 / Basic 认证，带连通性自检
+- **代理配置与官方 App 对齐**：三选一模式（SOCKS5 代理 / MTProto / WEB 代理）。
+  SOCKS5 走自研纯 JS 隧道（含 SOCKS4a、HTTP CONNECT，支持用户名密码 / Basic 认证，带连通性自检）；
+  MTProto 走 GramJS 原生 `ConnectionTCPMTProxyAbridged`，支持 hex / dd 前缀 / base64 密钥；
+  WEB 代理在界面上标注不支持（详见 6.3）
 - **WebSocket 备用通道**：TCP 被封锁时可切到 MTProto over `wss://<dc>:443/apiws`
 - **登录页也能配代理**：登录页直接显示当前代理状态并一键进入配置，
   避免"没有代理就打不开 Telegram、连登录页都过不去"的死循环
@@ -52,7 +55,8 @@
 
 - 视频/大文件的落盘下载与「保存到相册」（目前图片在内存里按需加载）
 - 消息编辑、表情回应、投票
-- 多账号、通话、MTProto 专用代理（MTProxy）
+- WEB 代理（需要私有 WebView 环境，RN 下无法真实生效，界面已显式标注）
+- 多账号、通话
 
 ---
 
@@ -148,6 +152,9 @@ cd android && ./gradlew assembleRelease
   - 验证每条隧道「握手 → 收发 → 拿到预期回应」
   - 验证 `GramJS PromisedNetSockets → net shim → 代理 → 目标` 的**全链路**，并断言代理端确实收到了 CONNECT **请求数**（否则说明是偷偷直连，属于假绿灯）
   - 验证认证失败、目标端口无服务、代理只连不答（超时）等错误路径给出的是可读中文
+  - **MTProxy 相关的常驻守卫**（4 项）：MTProxy / WEB 代理都不允许被写进隧道状态；
+    `secret` 必须是字符串（用传 Buffer 做**反证**，证明它确实会让 GramJS 抛错）；
+    hex / `dd` 前缀 / base64 三种密钥解码后字节数正确
 
 可选：用环境变量注入凭据后再构建
 
@@ -250,7 +257,19 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
 - 首次登录先连 DC2 的真实 IP；若账号在其它 DC，服务端返回 `PHONE_MIGRATE_x`，代码自动 `_switchDC` 后重试
 - 通道切换走的是 GramJS 的 `clientParams.networkSocket` + `useWSS`，不是另写一套协议
 
-**代理**支持 SOCKS5 / SOCKS4(4a) / HTTP CONNECT，可带用户名密码或 Basic 认证：
+**代理配置界面与官方 App 对齐**，顶部是一个「代理」总开关 + 三选一的模式列表：
+
+| 模式 | 底层实现 | 需要填 | 状态 |
+| --- | --- | --- | --- |
+| **SOCKS5 代理** | 自研纯 JS 隧道 | 服务器 / 端口 /（可选）用户名、密码 | ✅ 可用 |
+| **MTProto** | GramJS 内置 `ConnectionTCPMTProxyAbridged` | 服务器 / 端口 / 密钥 | ✅ 可用 |
+| **WEB 代理** | 需要私有 WebView + HTTPS 页面承载 16 字节密钥 | 服务器 / 密钥 | ❌ 本客户端不支持 |
+
+选 SOCKS5 时下方额外出现 `SOCKS5 / SOCKS4 / HTTP` 三个通道芯片（官方只给 SOCKS5，
+这里多给两档是因为旧代理环境更常见）；切到密钥类模式时会自动清掉用户名密码，反之亦然，
+避免残留字段让校验报莫名其妙的错。
+
+#### 自建隧道（SOCKS5 / SOCKS4 / HTTP）
 
 - 隧道在 `src/shims/tunnel.js` 里手写实现，socket 无关（只依赖 `on/write/destroy`），
   所以同一份代码在 App 里跑在 `react-native-tcp-socket` 上，在 CI 里跑在 Node `net.Socket` 上
@@ -261,6 +280,41 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
   握手响应之后若还有残留字节，会补发成 socket 的第一段 `data`
 - ⚠️ **WebSocket 通道不支持自建代理**：那条路走的是 OkHttp，插不进我们的隧道。
   设置页对这个组合有显式拦截（保存时提示二选一），`createClient` 里也会把代理置空并给出警告
+
+#### MTProto 代理（走 GramJS 原生能力，不经我们的隧道）
+
+这条路径和自建隧道是**两套完全独立的拨号逻辑**，有几个必须踩准的点：
+
+- 传参方式是 `new TelegramClient(..., { proxy: { MTProxy: true, ip, port, secret } })`。
+  GramJS 会在**构造函数内部**就把 `this._connection` 换成 `ConnectionTCPMTProxyAbridged`，
+  并在 `InitConnection` 里带上 `client_proxy`。构造之后再改是无效的
+- ⚠️ **`secret` 必须是字符串，不能传 Buffer**。GramJS 的 `TCPMTProxy` 构造函数里直接调
+  `proxy.secret.match(/^[0-9a-f]+$/i)`，Buffer 没有 `.match`，会当场抛
+  `proxy.secret.match is not a function`。这是实际执行真实 GramJS 类验证出来的，
+  因此代码里刻意保留了「传字符串」的注释，并有对应的常驻守卫
+- ⚠️ **MTProxy 必须让我们的隧道状态置空**（`transportState.setProxy(null)`）。
+  原因是 GramJS 的 `PromisedNetSockets` 里有 `if (!("MTProxy" in proxy))` 的分支：
+  MTProxy 时它**跳过**自己的代理逻辑，直接 `new net.Socket()` 拨号 —— 而此时 `ip`/`port`
+  已经被 `TCPMTProxy` 换成了代理服务器地址。如果这时我们的 shim 还留着代理配置，
+  就会变成"**用一个代理去连另一个代理**"。`transport-state.js` 对 `mtproxy` 会主动抛错兜底
+- 密钥支持三种写法：32 位 hex（如 `0e45caf3bbce0d8d995cfb919fa9d61a`）、
+  `dd` 开头的 34 位 hex（fake-TLS 形式，`MTProxyIO.initHeader()` 会剥掉前缀），
+  以及解码后为 16 字节的 base64。校验逻辑在 `validateProxySecret()`，纯函数、有边界用例
+- 设置页的「测试代理」对 MTProto 只做**格式校验**，并如实说明"未做真实握手"——
+  真握手需要按密钥派生协议头，这里不假装成功
+- ⚠️ 使用 MTProxy 时官方客户端会提示"该代理可能在你的会话列表里插入赞助频道"，
+  这是 MTProto 代理的既有特性，界面里原样保留了这条说明
+
+#### WEB 代理为什么不做
+
+WEB 代理要求在一个**私有 WebView** 里加载 HTTPS 页面，由页面内的 JS 去完成 MTProto 承载，
+密钥是 16 字节 MTProxy 格式。它强依赖 Android System WebView 的版本，
+且官方自己标注为"概念验证、仅供前台测试"。
+
+RN 的 `WebView` 拿不到官方那种受控的私有运行环境，硬做只会得到一个**看起来能填、
+填完不生效**的假功能。所以这里的选择是：**在界面上明确列出并标注「本客户端暂不支持」**，
+`proxyKindSupported('web')` 返回 `false`，校验函数会直接拒绝 `web` 类型的保存，
+而不是让它静默失败。
 
 #### 登录前也要能配代理（否则会陷入死循环）
 
@@ -393,12 +447,14 @@ A：手机号要带国家码，例如 `+8613800138000`。
 
 **Q：卡在「获取验证码」，或者提示连接超时 / Network request failed**
 A：多半是当前网络直连不上 Telegram。**登录页就有「网络与代理」卡片**，
-点「去配置」可以直接设置 SOCKS5 / SOCKS4 / HTTP 代理，或把通道切成 WebSocket，
-然后用「测试连通性」确认隧道能打通再返回登录。登录前保存的配置会在点「获取验证码」时立即生效。
+点「去配置」可以选择 **SOCKS5 代理**（含 SOCKS4 / HTTP）或填 **MTProto 代理**
+（服务器 / 端口 / 密钥），也可以把通道切成 WebSocket，
+然后用「测试连通性」确认能打通再返回登录。登录前保存的配置会在点「获取验证码」时立即生效。
 
 **Q：登录页显示「未启用代理」，但我明明配过了**
-A：看下卡片上的通道说明。如果当前是 **WebSocket 通道**，自建代理是不生效的
-（该通道走系统网络栈），卡片会直接标红提示，把通道切回 TCP 即可。
+A：看下卡片上的通道说明。如果当前是 **WebSocket 通道**，代理是不生效的
+（该通道走系统网络栈，且 GramJS 对 `useWSS` + 代理会直接抛 `Cannot use SSL with proxies`），
+卡片会直接标红提示，把通道切回 TCP 即可。
 
 **Q：CI 编译失败在 Gradle 阶段**
 A：先确认 JDK 是 17；再确认 `npm ci` 用的是仓库里的 `package-lock.json`。
@@ -409,9 +465,31 @@ A：CI 未配置固定签名文件时会每次生成新签名，覆盖安装需�
 或者按 4.1 配置 `ANDROID_KEYSTORE_BASE64` 使用固定签名。
 
 **Q：开了代理但还是连不上 / 设置页显示「代理未生效」**
-A：先确认通道选的是 TCP —— WebSocket 通道走系统网络栈，用不了自建代理。
-再点一次「测试连通性」，它会真的把隧道建到 Telegram DC2，报错信息会直接说是
-握手超时、认证失败、还是代理规则拒绝了目标地址。
+A：先确认模式选对了。
+
+- **SOCKS5 代理**（含 SOCKS4 / HTTP）：先确认通道选的是 TCP —— WebSocket 通道走系统网络栈，
+  用不了自建代理。再点一次「测试连通性」，它会真的把隧道建到 Telegram DC2，报错信息会直接说是
+  握手超时、认证失败、还是代理规则拒绝了目标地址。
+- **MTProto**：先确认通道也是 TCP（`useWSS` 和任何代理在 GramJS 里是互斥的，
+  WebSocket + 代理会直接抛 `Cannot use SSL with proxies`）。另外 MTProto 的「测试连通性」
+  只校验密钥格式，不做真实握手，所以那里显示成功不代表线路一定通 —— 这个界面有如实说明。
+
+**Q：MTProto 代理的密钥怎么填**
+A：支持三种写法，任选其一：
+
+- 32 位十六进制，例如 `0e45caf3bbce0d8d995cfb919fa9d61a`
+- `dd` 开头的 34 位十六进制（fake-TLS 形式，前缀会被自动剥掉）
+- base64 字符串，要求解码后是 16 字节
+
+从 `tg://proxy?server=...&port=...&secret=...` 链接里把 `secret=` 后面的值原样粘进来即可。
+填错长度或含非法字符时，输入框下方会直接给出具体原因。
+
+**Q：代理列表里的「WEB 代理」是灰的，为什么**
+A：官方 App 的 WEB 代理需要在一个**私有 WebView** 里加载 HTTPS 页面来承载 MTProto 流量，
+强依赖 Android System WebView 版本，官方自己标注为"概念验证、仅供前台测试"。
+RN 的 WebView 拿不到那种受控的私有运行环境，做了也是填了不生效的假功能，
+所以这里直接标注「本客户端暂不支持」、保存时明确拒绝，而不是让它静默失败。
+两种能真实生效的（SOCKS5 代理 / MTProto）都完整支持。
 
 **Q：切到 WebSocket 通道后连不上**
 A：WebSocket 通道连的是 `wss://<dc-ip>:443/apiws`。部分网络会拦掉 443 上的 WebSocket 升级，

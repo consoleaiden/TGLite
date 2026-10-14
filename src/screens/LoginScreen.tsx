@@ -17,7 +17,12 @@ import { completeLogin } from '../boot';
 import { API_CREDENTIALS_URL, BUILTIN_API_HASH, BUILTIN_API_ID, TELEGRAM_DC_IPV4 } from '../config';
 import type { RootStackParamList } from '../navigation';
 import { transportLabel } from '../net/transport';
-import { useSettingsStore, describePreLoginNetwork } from '../settings';
+import {
+  useSettingsStore,
+  describePreLoginNetwork,
+  describeProxyTarget,
+  proxyKindLabel,
+} from '../settings';
 import {
   createClient,
   humanizeAuthError,
@@ -195,7 +200,7 @@ export default function LoginScreen({ navigation }: Props) {
             <Text style={styles.netTitle}>网络与代理</Text>
             <Text style={styles.netValue}>
               {proxy.enabled
-                ? `${proxy.kind.toUpperCase()} ${proxy.host || '(未填地址)'}:${proxy.port || '-'}`
+                ? `${proxyKindLabel(proxy.kind)} ${describeProxyTarget(proxy)}`
                 : '未启用代理'}
               {` · 通道 ${transportLabel(transport)}`}
             </Text>

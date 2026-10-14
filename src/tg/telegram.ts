@@ -170,6 +170,10 @@ export async function createClient(
     connection: ConnectionTCPObfuscated,
     // 备用通道：MTProto over WebSocket。wss 走系统网络栈，需要 DC 端口为 443。
     networkSocket: plan.networkSocket,
+    // MTProxy 专用：GramJS 看到 { MTProxy: true } 会把连接实现换成
+    // ConnectionTCPMTProxyAbridged，并自动附带 InitConnection.client_proxy。
+    // 非 MTProxy 时必须传 undefined，否则 GramJS 会误判成 MTProxy 模式。
+    proxy: plan.gramjsProxy,
     useWSS: plan.useWSS,
     // 必须显式关闭 IPv6：Client.getDC 会按这个字段过滤 DC 列表
     useIPV6: false,

@@ -12,7 +12,14 @@
 import {
   DEFAULT_SETTINGS,
   describePreLoginNetwork,
+  describeProxyTarget,
+  proxyKindLabel,
+  proxyKindSupported,
+  proxyNeedsSecret,
   proxySupportsTransport,
+  validateProxy,
+  validateProxySecret,
+  type ProxyKind,
   type ProxySetting,
   type TransportKind,
 } from '../src/settings';
@@ -20,6 +27,9 @@ import {
 function proxy(overrides: Partial<ProxySetting> = {}): ProxySetting {
   return { ...DEFAULT_SETTINGS.proxy, enabled: true, host: '127.0.0.1', port: '1080', ...overrides };
 }
+
+/** 图 2/3 里那个真实密钥，用来验证官方那种密钥能被接受 */
+const REAL_SECRET = '0e45caf3bbce0d8d995cfb919fa9d61a';
 
 describe('describePreLoginNetwork', () => {
   it('未启用代理：直连，并提示去配置', () => {
@@ -94,5 +104,143 @@ describe('proxySupportsTransport', () => {
     for (const transport of off) {
       expect(proxySupportsTransport(proxy({ enabled: false }), transport)).toBe(true);
     }
+  });
+
+  it('MTProxy 也只在 TCP 下可用（它不是隧道，但同样依赖 TCP 连接）', () => {
+    expect(proxySupportsTransport(proxy({ kind: 'mtproxy', secret: REAL_SECRET }), 'tcp')).toBe(true);
+    expect(proxySupportsTransport(proxy({ kind: 'mtproxy', secret: REAL_SECRET }), 'wss')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 对齐官方 App「代理信息」页的三种模式
+// ---------------------------------------------------------------------------
+describe('官方三种代理模式：数据模型与校验', () => {
+  it('socks5 / socks4 / http 不要求密钥', () => {
+    for (const kind of ['socks5', 'socks4', 'http'] as const) {
+      expect(proxyNeedsSecret(kind)).toBe(false);
+      expect(validateProxy(proxy({ kind }))).toBeNull();
+    }
+  });
+
+  it('mtproxy 必须填密钥', () => {
+    expect(proxyNeedsSecret('mtproxy')).toBe(true);
+    expect(validateProxy(proxy({ kind: 'mtproxy' }))).toContain('密钥');
+  });
+
+  it('mtproxy 接受官方那种 32 位十六进制密钥', () => {
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: REAL_SECRET }))).toBeNull();
+  });
+
+  it('mtproxy 接受 dd 开头的 34 位密钥（伪造 TLS 形式）', () => {
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: `dd${REAL_SECRET}` }))).toBeNull();
+  });
+
+  it('mtproxy 拒绝长度不对的十六进制密钥', () => {
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: 'abcd' }))).toContain('32 位');
+  });
+
+  it('mtproxy 接受 base64 形式且解码后正好 16 字节', () => {
+    const b64 = Buffer.from(new Uint8Array(16).fill(0x7f)).toString('base64');
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: b64 }))).toBeNull();
+  });
+
+  it('mtproxy 拒绝解码后不是 16 字节的 base64', () => {
+    const tooLong = Buffer.from(new Uint8Array(32).fill(0x7f)).toString('base64');
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: tooLong }))).toContain('16 字节');
+  });
+
+  it('web 模式明确判为不支持，且给出可读原因', () => {
+    expect(proxyKindSupported('web')).toBe(false);
+    const err = validateProxy(proxy({ kind: 'web' }));
+    expect(err).toContain('WEB 代理');
+    expect(err).toContain('无法支持');
+  });
+
+  it('web 模式不校验端口（官方界面就没有端口字段）', () => {
+    // 故意留空端口：不该因此报端口错
+    const err = validateProxy(proxy({ kind: 'web', port: '' }));
+    expect(err ?? '').not.toContain('端口');
+  });
+
+  it('其余四种模式都判为支持', () => {
+    for (const kind of ['socks5', 'socks4', 'http', 'mtproxy'] as const) {
+      expect(proxyKindSupported(kind)).toBe(true);
+    }
+  });
+
+  it('关掉代理时即使模式不支持也不报错（不该拦着用户保存）', () => {
+    expect(validateProxy(proxy({ kind: 'web', enabled: false }))).toBeNull();
+  });
+});
+
+describe('validateProxySecret 边界', () => {
+  it('空密钥给出「去链接里找」的引导，而不是干巴巴的"格式错误"', () => {
+    const err = validateProxySecret('');
+    expect(err).toBeTruthy();
+    expect(err).toContain('密钥');
+  });
+
+  it('含有非法字符的密钥被拒', () => {
+    expect(validateProxySecret('not-a-valid-secret!!')).toContain('格式');
+  });
+
+  it('两端空白会被容忍', () => {
+    expect(validateProxySecret(`  ${REAL_SECRET}  `)).toBeNull();
+  });
+});
+
+describe('proxyKindLabel / describeProxyTarget', () => {
+  it('每种类型都有中文名，且不是空串或 undefined 字样', () => {
+    const kinds: ProxyKind[] = ['socks5', 'socks4', 'http', 'mtproxy', 'web'];
+    for (const kind of kinds) {
+      const label = proxyKindLabel(kind);
+      expect(typeof label).toBe('string');
+      expect(label.length).toBeGreaterThan(0);
+      // 标签会被直接拼进界面文案，混进 "undefined" 说明有分支漏了
+      expect(label).not.toContain('undefined');
+    }
+  });
+
+  it('mtproxy / web 的中文名与官方界面一致', () => {
+    expect(proxyKindLabel('mtproxy')).toBe('MTProto 代理');
+    expect(proxyKindLabel('web')).toBe('WEB 代理');
+  });
+
+  it('普通模式拼成 host:port', () => {
+    expect(describeProxyTarget(proxy({ host: 'app.sosun4ik.top', port: '443' })))
+      .toBe('app.sosun4ik.top:443');
+  });
+
+  it('web 模式不拼端口（官方界面没有端口）', () => {
+    expect(describeProxyTarget(proxy({ kind: 'web', host: 'app.sosun4ik.top', port: '' })))
+      .toBe('app.sosun4ik.top');
+  });
+
+  it('地址为空时给占位符，不留出 ":" 这种脏尾巴', () => {
+    expect(describeProxyTarget(proxy({ host: '   ' }))).toBe('(未填写)');
+  });
+});
+
+describe('登录前提示覆盖新的代理模式', () => {
+  it('mtproxy 会判为走代理，且提示里是「MTProto 代理」而不是生硬的 MTPROXY', () => {
+    const hint = describePreLoginNetwork('tcp', proxy({ kind: 'mtproxy', secret: REAL_SECRET }));
+    expect(hint.willUseProxy).toBe(true);
+    expect(hint.warning).toBeNull();
+    expect(hint.message).toContain('MTProto 代理');
+    expect(hint.message).toContain('127.0.0.1:1080');
+  });
+
+  it('mtproxy 缺密钥时判为退回直连', () => {
+    const hint = describePreLoginNetwork('tcp', proxy({ kind: 'mtproxy', secret: '' }));
+    expect(hint.willUseProxy).toBe(false);
+    expect(hint.warning).toContain('密钥');
+  });
+
+  it('web 模式判为不会生效，并说明原因', () => {
+    const hint = describePreLoginNetwork('tcp', proxy({ kind: 'web' }));
+    expect(hint.willUseProxy).toBe(false);
+    expect(hint.warning).toContain('WEB 代理');
+    expect(hint.message).toContain('退回直连');
   });
 });
