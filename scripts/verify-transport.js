@@ -739,6 +739,133 @@ async function main() {
   });
 
   // ---------------------------------------------------------------------
+  // fake-TLS（ee 模式）：结构必须自洽，否则服务端 get_sni_domain_info() 会
+  // 找不到 SNI，把连接当普通 TLS 转发到真实上游 —— 表现为「格式没错但连不上」。
+  // 这里不依赖 jest，直接用官方解析逻辑复走一遍。
+  // ---------------------------------------------------------------------
+  await check('fake-TLS ClientHello 结构自洽（长度 / SNI / 套件表都对得上）', async () => {
+    const mod = require(path.join(__dirname, '..', 'src', 'net', 'mtproxy-faketls.js'));
+    const build = mod.buildClientHello || (mod.default && mod.default.buildClientHello);
+    assert.ok(build, 'fake-TLS 模块应导出 buildClientHello');
+
+    // 固定随机源，保证可复现
+    const fixedRandom = (seed) => {
+      let x = seed;
+      return (n) => {
+        const b = Buffer.alloc(n);
+        for (let i = 0; i < n; i++) {
+          x = (x * 1103515245 + 12345) & 0x7fffffff;
+          b[i] = x & 0xff;
+        }
+        return b;
+      };
+    };
+
+    const DOMAIN = 'mt.akenai.click';
+    const hello = build(DOMAIN, { randomBytes: fixedRandom(7), shuffle: true });
+
+    assert.strictEqual(hello.length, 517, `紧凑版应为 517 字节，实际 ${hello.length}`);
+    assert.strictEqual(hello[0], 0x16, '首字节应为 TLS handshake 0x16');
+    assert.strictEqual((hello[3] << 8) | hello[4], hello.length - 5, 'record 声明长度应与实际一致');
+
+    // 按官方 get_sni_domain_info() 复走
+    let pos = 11 + 32 + 1 + 32;
+    const csLen = (hello[pos] << 8) | hello[pos + 1];
+    pos += 2;
+    assert.strictEqual(hello[pos + csLen], 1, '压缩方法长度应为 1');
+    assert.strictEqual(hello[pos + csLen + 1], 0, '压缩方法应为 null(0)');
+    pos += csLen + 4;
+
+    let sni = null;
+    while (pos + 4 <= hello.length) {
+      const id = (hello[pos] << 8) | hello[pos + 1];
+      const el = (hello[pos + 2] << 8) | hello[pos + 3];
+      pos += 4;
+      if (id === 0) {
+        const inner = (hello[pos] << 8) | hello[pos + 1];
+        const typ = hello[pos + 2];
+        const dl = (hello[pos + 3] << 8) | hello[pos + 4];
+        assert.strictEqual(inner, el - 2, 'SNI 内层长度应等于扩展长度-2');
+        assert.strictEqual(typ, 0, 'SNI 类型应为 0');
+        assert.strictEqual(dl, el - 5, 'SNI 域名长度应等于扩展长度-5');
+        sni = hello.subarray(pos + 5, pos + 5 + dl).toString('ascii');
+        break;
+      }
+      pos += el;
+    }
+    assert.strictEqual(sni, DOMAIN, `SNI 应能还原为 ${DOMAIN}，实际 ${sni}`);
+  });
+
+  await check('fake-TLS random 字段 = HMAC(secret, hello) ⊕ 时间戳（官方算法）', async () => {
+    const crypto = require('crypto');
+    const mod = require(path.join(__dirname, '..', 'src', 'net', 'mtproxy-faketls.js'));
+    const build = mod.buildClientHello || mod.default.buildClientHello;
+    const fill = mod.fillClientRandom || mod.default.fillClientRandom;
+
+    const secret = Buffer.from('54ce330e4690cc297d2b031ff3f288b0', 'hex');
+    const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+
+    const hello = build('mt.akenai.click', {
+      randomBytes: (n) => Buffer.alloc(n, 3),
+      shuffle: false,
+    });
+    const ts = 1700000000;
+    fill(hello, secret, hmac, ts);
+
+    const blank = Buffer.from(hello);
+    blank.fill(0, 11, 43);
+    const expected = hmac(secret, blank);
+
+    assert.ok(
+      Buffer.from(hello.subarray(11, 39)).equals(expected.subarray(0, 28)),
+      'random 前 28 字节应等于 HMAC 前 28 字节',
+    );
+    const recovered = (expected.readUInt32BE(28) ^ hello.readUInt32BE(39)) >>> 0;
+    assert.strictEqual(recovered, ts >>> 0, 'random 后 4 字节异或后应能还原时间戳');
+  });
+
+  await check('fake-TLS ServerHello 必须校验 HMAC（否则会把上游 Alert 当成功）', async () => {
+    const crypto = require('crypto');
+    const mod = require(path.join(__dirname, '..', 'src', 'net', 'mtproxy-faketls.js'));
+    const verify = mod.verifyServerHello || mod.default.verifyServerHello;
+
+    const secret = Buffer.from('54ce330e4690cc297d2b031ff3f288b0', 'hex');
+    const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+    const clientRandom = Buffer.alloc(32, 0x11);
+
+    // 服务端生成顺序：先对「11..43 待填」的响应算 MAC，再写回去
+    const resp = Buffer.alloc(132, 0xab);
+    resp[0] = 0x16;
+    const blank = Buffer.from(resp);
+    blank.fill(0, 11, 43);
+    hmac(secret, Buffer.concat([clientRandom, blank])).copy(resp, 11);
+
+    assert.strictEqual(verify(clientRandom, secret, resp, hmac), true, '正确响应应通过');
+    assert.strictEqual(
+      verify(clientRandom, Buffer.alloc(16, 0x22), resp, hmac),
+      false,
+      '密钥不匹配必须判失败（这正是「被转发到上游」时的情形）',
+    );
+
+    const tampered = Buffer.from(resp);
+    tampered[100] ^= 0x01;
+    assert.strictEqual(verify(clientRandom, secret, tampered, hmac), false, '篡改一个字节必须失败');
+  });
+
+  await check('fake-TLS 记录 payload 明文直传（不套 AES，这是官方行为）', async () => {
+    const mod = require(path.join(__dirname, '..', 'src', 'net', 'mtproxy-faketls.js'));
+    const wrap = mod.wrapRecord || mod.default.wrapRecord;
+    const prefix = mod.POST_HANDSHAKE_PREFIX || mod.default.POST_HANDSHAKE_PREFIX;
+
+    const payload = Buffer.from('deadbeef', 'hex');
+    const rec = wrap(payload);
+    assert.strictEqual(rec.subarray(0, 5).toString('hex'), '1703030004', '记录头应为 17 03 03 + 长度');
+    assert.ok(rec.subarray(5).equals(payload), 'payload 必须原样出现，没有任何加密');
+
+    assert.strictEqual(prefix.toString('hex'), '140303000101170303', '握手后固定 9 字节前缀应正确');
+  });
+
+  // ---------------------------------------------------------------------
   // 收尾
   // ---------------------------------------------------------------------
   transportState.setProxy(null);

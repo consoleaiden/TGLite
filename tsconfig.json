@@ -1,3 +1,10 @@
 {
-  "extends": "@react-native/typescript-config/tsconfig.json"
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "compilerOptions": {
+    // 项目里有少量代码/测试要用 Node 的 Buffer 编码重载与 crypto
+    // （fake-TLS 的 HMAC、密钥裁剪等）。RN 的默认 tsconfig 不带 node types，
+    // 不显式加上就会报 "Cannot find module 'crypto'" 与
+    // "Property 'readUInt32BE' does not exist on type 'Buffer'"。
+    "types": ["node", "jest"]
+  }
 }
