@@ -7,6 +7,8 @@ import { computeCheck } from 'telegram/Password';
 import { StringSession } from 'telegram/sessions';
 
 import { APP_VERSION, BOOTSTRAP_DC, DIALOG_FETCH_LIMIT, MESSAGE_FETCH_LIMIT } from '../config';
+import { applyTransportSettings, type TransportPlan } from '../net/transport';
+import { currentSettings } from '../settings';
 
 const SESSION_KEY = '@tglite/session_v1';
 const CREDENTIALS_KEY = '@tglite/credentials_v1';
@@ -48,6 +50,9 @@ export interface ChatMessage {
 
 let client: TelegramClient | null = null;
 let credentials: StoredCredentials | null = null;
+
+/** 本次连接实际采用的传输方案，设置页要展示「代理到底有没有生效」 */
+let lastTransportPlan: TransportPlan | null = null;
 
 /** peerKey -> InputPeer，避免每次操作都走网络解析 accessHash */
 const peerCache = new Map<string, any>();
@@ -103,6 +108,10 @@ export function isClientReady(): boolean {
   return client !== null;
 }
 
+export function lastTransport(): TransportPlan | null {
+  return lastTransportPlan;
+}
+
 export async function createClient(
   creds: StoredCredentials,
   sessionString = '',
@@ -117,12 +126,19 @@ export async function createClient(
   }
   peerCache.clear();
 
+  // 代理 / 通道必须在 new TelegramClient 之前落到 shim 层：
+  // GramJS 会在构造函数里就把 networkSocket 定下来，之后再改是无效的。
+  const plan = applyTransportSettings(currentSettings());
+  lastTransportPlan = plan;
+
   const session = new StringSession(sessionString);
 
   const instance = new TelegramClient(session, creds.apiId, creds.apiHash, {
     // 走 obfuscated2 裸 TCP，与官方客户端同款传输层，抗 DPI 且比明文 TCP 稳
     connection: ConnectionTCPObfuscated,
-    useWSS: false,
+    // 备用通道：MTProto over WebSocket。wss 走系统网络栈，需要 DC 端口为 443。
+    networkSocket: plan.networkSocket,
+    useWSS: plan.useWSS,
     // 必须显式关闭 IPv6：Client.getDC 会按这个字段过滤 DC 列表
     useIPV6: false,
     connectionRetries: 10,
@@ -149,6 +165,24 @@ export async function createClient(
   client = instance;
   credentials = creds;
   return instance;
+}
+
+/**
+ * 按当前设置重建连接。
+ * 代理与通道都是「拨号期」参数，改完必须重连才会生效，
+ * 这里把旧的实时监听也一并换掉，避免事件挂在已销毁的连接上。
+ */
+export async function reconnectClient(): Promise<TransportPlan> {
+  const creds = credentials ?? (await loadCredentials());
+  if (!creds) throw new Error('缺少 api_id / api_hash，请重新登录。');
+
+  const sessionString = await readSessionString();
+  await createClient(creds, sessionString);
+  const authorized = await isAuthorized();
+  if (!authorized) throw new Error('会话已失效，请重新登录。');
+  await persistSession();
+
+  return lastTransportPlan as TransportPlan;
 }
 
 export async function isAuthorized(): Promise<boolean> {
@@ -369,11 +403,37 @@ export function rememberPeer(key: string, inputEntity: any): void {
   if (key && inputEntity) peerCache.set(key, inputEntity);
 }
 
+export function forgetPeer(key: string): void {
+  peerCache.delete(key);
+}
+
 async function resolvePeer(peerKey: string): Promise<any> {
   const cached = peerCache.get(peerKey);
   if (cached) return cached;
   // 兜底：让 GramJS 用带 mark 的字符串 id 去解析（会走 session / 网络）
   return peerKey;
+}
+
+/** 解析出完整实体（自己/用户/群/频道），会走网络并自动进 GramJS 的实体缓存 */
+export async function resolveEntity(peerKey: string): Promise<any> {
+  const tg = getClient();
+  return tg.getEntity(await resolvePeer(peerKey));
+}
+
+/** 实体 -> peerKey，与 loadDialogs / 实时消息里的 key 保持同一套规则 */
+export async function peerKeyOfEntity(entity: any): Promise<string> {
+  const tg = getClient();
+  try {
+    return String(await (tg as any).getPeerId(entity));
+  } catch {
+    return '';
+  }
+}
+
+/** InputChannel / InputChat 之类的 InputPeer，群组管理接口要的就是它 */
+export async function getInputEntity(peerKey: string): Promise<any> {
+  const tg = getClient();
+  return tg.getInputEntity(await resolvePeer(peerKey));
 }
 
 // ---------------------------------------------------------------------------

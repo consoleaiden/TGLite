@@ -1,3 +1,4 @@
+import { useSettingsStore } from './settings';
 import { useAppStore } from './store';
 import {
   createClient,
@@ -14,6 +15,7 @@ let realtimeAttached = false;
 
 /**
  * 启动流程：
+ *   0. 先把本地设置（过滤规则 / 代理 / 通道）读进来 —— 建连前必须就绪
  *   1. 有凭据 + 有可用会话 -> 直接进主界面
  *   2. 否则回到登录页
  */
@@ -21,6 +23,8 @@ export async function bootstrapApp(): Promise<void> {
   const store = useAppStore.getState();
 
   try {
+    await useSettingsStore.getState().hydrate();
+
     const creds = await loadCredentials();
     if (!creds) {
       store.setStage('login');

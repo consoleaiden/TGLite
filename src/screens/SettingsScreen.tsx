@@ -1,11 +1,14 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
 import { APP_NAME, APP_VERSION } from '../config';
+import { splitKeywords } from '../filters';
 import type { RootStackParamList } from '../navigation';
+import { proxyActuallyInUse, transportLabel } from '../net/transport';
+import { useSettingsStore } from '../settings';
 import { useAppStore } from '../store';
 import { detachRealtime } from '../boot';
 import { getCredentials, humanizeAuthError, logout } from '../tg/telegram';
@@ -19,6 +22,14 @@ export default function SettingsScreen({ navigation }: Props) {
   const reset = useAppStore((state) => state.reset);
   const setMe = useAppStore((state) => state.setMe);
   const [busy, setBusy] = useState(false);
+
+  const ad = useSettingsStore((state) => state.ad);
+  const minor = useSettingsStore((state) => state.minor);
+  const transport = useSettingsStore((state) => state.transport);
+  const proxy = useSettingsStore((state) => state.proxy);
+
+  const adCount = useMemo(() => splitKeywords(ad.raw).length, [ad.raw]);
+  const minorCount = useMemo(() => splitKeywords(minor.raw).length, [minor.raw]);
 
   const creds = getCredentials();
 
@@ -64,13 +75,53 @@ export default function SettingsScreen({ navigation }: Props) {
       </View>
 
       <View style={styles.card}>
+        <Text style={styles.cardTitle}>内容过滤</Text>
+        <LinkRow
+          label="广告设置"
+          value={ad.enabled ? `已启用 · ${adCount} 个关键词` : '已停用'}
+          onPress={() => navigation.navigate('Filters', { kind: 'ad' })}
+        />
+        <LinkRow
+          label="未成年设置"
+          value={minor.enabled ? `已启用 · ${minorCount} 个关键词` : '已停用'}
+          onPress={() => navigation.navigate('Filters', { kind: 'minor' })}
+        />
+        <Text style={styles.paragraph}>
+          广告设置命中的消息会折叠成一行提示，点击可以展开或收起，默认隐藏；未成年设置命中的消息
+          则彻底不显示，也不会留下任何提示。两者都只作用于本机的显示，不会改动服务端消息。
+        </Text>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>网络与代理</Text>
+        <LinkRow
+          label="传输通道"
+          value={transportLabel(transport)}
+          onPress={() => navigation.navigate('Network')}
+        />
+        <LinkRow
+          label="代理"
+          value={
+            proxy.enabled
+              ? `${proxy.kind.toUpperCase()} ${proxy.host || '(未填地址)'}:${proxy.port || '-'}${
+                  proxyActuallyInUse() ? '' : ' · 当前未生效'
+                }`
+              : '未启用'
+          }
+          onPress={() => navigation.navigate('Network')}
+        />
+        {transport === 'wss' && proxy.enabled ? (
+          <Text style={styles.warn}>WebSocket 通道不支持自定义代理，请到网络设置里处理。</Text>
+        ) : null}
+      </View>
+
+      <View style={styles.card}>
         <Text style={styles.cardTitle}>接入信息</Text>
         <Row label="api_id" value={creds ? String(creds.apiId) : '未配置'} />
         <Row
           label="api_hash"
           value={creds ? `${creds.apiHash.slice(0, 6)}${'*'.repeat(8)}${creds.apiHash.slice(-4)}` : '未配置'}
         />
-        <Row label="传输层" value="MTProto obfuscated2 / 裸 TCP 443" />
       </View>
 
       <View style={styles.card}>
@@ -83,6 +134,9 @@ export default function SettingsScreen({ navigation }: Props) {
         <Text style={styles.paragraph}>
           本客户端只实现收发消息所必需的最小接口集合，完全不请求、也不渲染任何推广内容，
           因此从原理上就没有广告位。同理也不会带上官方客户端的推荐频道、贴纸推广、Premium 广告位。
+        </Text>
+        <Text style={styles.paragraph}>
+          上面的「广告设置」是额外一层本地兜底：用来过滤那些由普通用户发出来的第三方推广消息。
         </Text>
       </View>
 
@@ -109,6 +163,22 @@ function Row({ label, value }: { label: string; value: string }) {
         {value}
       </Text>
     </View>
+  );
+}
+
+function LinkRow({ label, value, onPress }: { label: string; value: string; onPress: () => void }) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      onPress={onPress}
+      style={({ pressed }) => [styles.row, pressed ? styles.rowPressed : null]}
+    >
+      <Text style={styles.rowLabel}>{label}</Text>
+      <Text style={styles.rowValue} numberOfLines={2}>
+        {value}
+      </Text>
+      <Text style={styles.chevron}>›</Text>
+    </Pressable>
   );
 }
 
@@ -156,6 +226,20 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: spacing.lg,
     paddingVertical: 3,
+  },
+  rowPressed: {
+    opacity: 0.6,
+  },
+  chevron: {
+    fontSize: 18,
+    lineHeight: 20,
+    color: colors.textFaint,
+    marginTop: -1,
+  },
+  warn: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: colors.danger,
   },
   rowLabel: {
     fontSize: 14,

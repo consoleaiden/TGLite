@@ -10,6 +10,8 @@ interface AppState {
   dialogs: DialogItem[];
   dialogsLoading: boolean;
   dialogsError: string | null;
+  /** 每加一次就让会话列表强制重拉（加入群组、退出、切换传输通道后都要） */
+  dialogsRevision: number;
   /** 每个会话的未读数本地快照，用于收到新消息时即时更新红点 */
   unread: Record<string, number>;
 
@@ -18,6 +20,8 @@ interface AppState {
   setDialogs: (dialogs: DialogItem[]) => void;
   setDialogsLoading: (loading: boolean) => void;
   setDialogsError: (error: string | null) => void;
+  requestDialogsRefresh: () => void;
+  removeDialog: (peerKey: string) => void;
   bumpUnread: (peerKey: string) => void;
   clearUnread: (peerKey: string) => void;
   /** 收到新消息时把对应会话顶到最前面并更新预览 */
@@ -31,6 +35,7 @@ const initialState = {
   dialogs: [] as DialogItem[],
   dialogsLoading: false,
   dialogsError: null as string | null,
+  dialogsRevision: 0,
   unread: {} as Record<string, number>,
 };
 
@@ -49,6 +54,14 @@ export const useAppStore = create<AppState>((set) => ({
     }),
   setDialogsLoading: (dialogsLoading) => set({ dialogsLoading }),
   setDialogsError: (dialogsError) => set({ dialogsError }),
+  requestDialogsRefresh: () => set((state) => ({ dialogsRevision: state.dialogsRevision + 1 })),
+
+  removeDialog: (peerKey) =>
+    set((state) => {
+      const unread = { ...state.unread };
+      delete unread[peerKey];
+      return { dialogs: state.dialogs.filter((dialog) => dialog.key !== peerKey), unread };
+    }),
 
   bumpUnread: (peerKey) =>
     set((state) => ({ unread: { ...state.unread, [peerKey]: (state.unread[peerKey] || 0) + 1 } })),

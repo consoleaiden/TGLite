@@ -1,5 +1,5 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -14,7 +14,9 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import MessageBubble from '../components/MessageBubble';
+import { classifyText, compileRule, shouldDropMessage } from '../filters';
 import type { RootStackParamList } from '../navigation';
+import { useSettingsStore } from '../settings';
 import { useAppStore } from '../store';
 import { onIncoming } from '../tg/bus';
 import type { ChatMessage } from '../tg/telegram';
@@ -34,6 +36,25 @@ export default function ChatScreen({ navigation, route }: Props) {
   const [input, setInput] = useState('');
   const [error, setError] = useState<string | null>(null);
   const reachedStart = useRef(false);
+
+  // 关键词规则订阅成 4 个基本类型，避免每次 set 都触发整页重渲染
+  const adEnabled = useSettingsStore((state) => state.ad.enabled);
+  const adRaw = useSettingsStore((state) => state.ad.raw);
+  const minorEnabled = useSettingsStore((state) => state.minor.enabled);
+  const minorRaw = useSettingsStore((state) => state.minor.raw);
+
+  const adRule = useMemo(() => compileRule(adEnabled, adRaw), [adEnabled, adRaw]);
+  const minorRule = useMemo(() => compileRule(minorEnabled, minorRaw), [minorEnabled, minorRaw]);
+
+  /**
+   * 过滤在渲染层做，而不是在拉取时做：
+   * 用户改完关键词回到聊天页，历史消息会立刻按新规则重新判定，不需要重新拉取。
+   */
+  const visibleMessages = useMemo(
+    () => messages.filter((item) => !shouldDropMessage(classifyText(item.text, adRule, minorRule))),
+    [messages, adRule, minorRule],
+  );
+  const hiddenCount = messages.length - visibleMessages.length;
 
   /** 去重 + 把「发送中」的本地消息替换成服务端返回的真实消息 */
   const mergeMessage = useCallback((incoming: ChatMessage) => {
@@ -156,10 +177,26 @@ export default function ChatScreen({ navigation, route }: Props) {
         >
           <Text style={styles.backText}>返回</Text>
         </Pressable>
-        <Text style={styles.headerTitle} numberOfLines={1}>
-          {title}
-        </Text>
-        <View style={styles.back} />
+        <Pressable
+          accessibilityRole="button"
+          style={styles.titleWrap}
+          onPress={() => navigation.navigate('ChatInfo', { peerKey, title })}
+        >
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {title}
+          </Text>
+          <Text style={styles.headerSub}>
+            {hiddenCount > 0 ? `点击查看群信息 · 已隐藏 ${hiddenCount} 条` : '点击查看群信息'}
+          </Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          hitSlop={12}
+          style={styles.back}
+          onPress={() => navigation.navigate('ChatInfo', { peerKey, title })}
+        >
+          <Text style={styles.headerAction}>详情</Text>
+        </Pressable>
       </View>
 
       {loading ? (
@@ -170,10 +207,12 @@ export default function ChatScreen({ navigation, route }: Props) {
       ) : (
         <FlatList
           style={styles.list}
-          data={messages}
+          data={visibleMessages}
           inverted
           keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <MessageBubble message={item} />}
+          renderItem={({ item }) => (
+            <MessageBubble message={item} filter={classifyText(item.text, adRule, minorRule)} />
+          )}
           contentContainerStyle={styles.listContent}
           onEndReached={handleLoadMore}
           onEndReachedThreshold={0.4}
@@ -182,7 +221,9 @@ export default function ChatScreen({ navigation, route }: Props) {
           }
           ListEmptyComponent={
             <View style={styles.emptyWrap}>
-              <Text style={styles.centerText}>还没有消息，打个招呼吧</Text>
+              <Text style={styles.centerText}>
+                {hiddenCount > 0 ? '消息都被过滤规则隐藏了' : '还没有消息，打个招呼吧'}
+              </Text>
             </View>
           }
         />
@@ -238,11 +279,24 @@ const styles = StyleSheet.create({
     color: colors.primary,
   },
   headerTitle: {
-    flex: 1,
-    textAlign: 'center',
     fontSize: 17,
     fontWeight: '600',
     color: colors.text,
+    textAlign: 'center',
+  },
+  titleWrap: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  headerSub: {
+    marginTop: 1,
+    fontSize: 11,
+    color: colors.textFaint,
+  },
+  headerAction: {
+    fontSize: 15,
+    color: colors.primary,
+    textAlign: 'right',
   },
   list: {
     flex: 1,

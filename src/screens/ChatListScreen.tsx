@@ -2,6 +2,7 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Pressable,
   RefreshControl,
@@ -13,8 +14,11 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Avatar from '../components/Avatar';
+import { classifyText, compileRule, maskPreviewText } from '../filters';
 import type { RootStackParamList } from '../navigation';
+import { useSettingsStore } from '../settings';
 import { useAppStore } from '../store';
+import { leaveChat } from '../tg/groups';
 import type { DialogItem } from '../tg/telegram';
 import { loadDialogs } from '../tg/telegram';
 import { colors, spacing } from '../theme';
@@ -32,9 +36,20 @@ export default function ChatListScreen({ navigation }: Props) {
   const dialogs = useAppStore((state) => state.dialogs);
   const unread = useAppStore((state) => state.unread);
   const loading = useAppStore((state) => state.dialogsLoading);
+  const revision = useAppStore((state) => state.dialogsRevision);
   const setDialogs = useAppStore((state) => state.setDialogs);
   const setLoading = useAppStore((state) => state.setDialogsLoading);
   const setError = useAppStore((state) => state.setDialogsError);
+  const removeDialog = useAppStore((state) => state.removeDialog);
+  const requestDialogsRefresh = useAppStore((state) => state.requestDialogsRefresh);
+
+  const adEnabled = useSettingsStore((state) => state.ad.enabled);
+  const adRaw = useSettingsStore((state) => state.ad.raw);
+  const minorEnabled = useSettingsStore((state) => state.minor.enabled);
+  const minorRaw = useSettingsStore((state) => state.minor.raw);
+
+  const adRule = useMemo(() => compileRule(adEnabled, adRaw), [adEnabled, adRaw]);
+  const minorRule = useMemo(() => compileRule(minorEnabled, minorRaw), [minorEnabled, minorRaw]);
 
   const [query, setQuery] = useState('');
   const [refreshing, setRefreshing] = useState(false);
@@ -58,7 +73,7 @@ export default function ChatListScreen({ navigation }: Props) {
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, revision]);
 
   const visible = useMemo(() => {
     const sorted = [...dialogs].sort((a, b) => {
@@ -77,17 +92,64 @@ export default function ChatListScreen({ navigation }: Props) {
     [navigation],
   );
 
+  const handleLeave = useCallback(
+    async (dialog: DialogItem) => {
+      try {
+        await leaveChat(dialog.key);
+        removeDialog(dialog.key);
+        requestDialogsRefresh();
+      } catch (err) {
+        Alert.alert('退出失败', err instanceof Error ? err.message : String(err));
+      }
+    },
+    [removeDialog, requestDialogsRefresh],
+  );
+
+  const onLongPress = useCallback(
+    (dialog: DialogItem) => {
+      const buttons: Array<{ text: string; style?: 'cancel' | 'destructive'; onPress?: () => void }> = [
+        {
+          text: '查看群信息',
+          onPress: () => navigation.navigate('ChatInfo', { peerKey: dialog.key, title: dialog.title }),
+        },
+      ];
+      if (dialog.isGroup || dialog.isChannel) {
+        buttons.push({
+          text: '退出',
+          style: 'destructive',
+          onPress: () =>
+            Alert.alert('退出会话', `确定退出「${dialog.title}」？退出后需要重新加入才能看到消息。`, [
+              { text: '取消', style: 'cancel' },
+              { text: '退出', style: 'destructive', onPress: () => handleLeave(dialog) },
+            ]),
+        });
+      }
+      buttons.push({ text: '取消', style: 'cancel' });
+      Alert.alert(dialog.title, '选择要执行的操作', buttons);
+    },
+    [handleLeave, navigation],
+  );
+
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>对话</Text>
-        <Pressable
-          accessibilityRole="button"
-          style={styles.headerButton}
-          onPress={() => navigation.navigate('Settings')}
-        >
-          <Text style={styles.headerButtonText}>设置</Text>
-        </Pressable>
+        <View style={styles.headerButtons}>
+          <Pressable
+            accessibilityRole="button"
+            style={styles.headerButton}
+            onPress={() => navigation.navigate('Join')}
+          >
+            <Text style={styles.headerButtonText}>加入群组</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            style={styles.headerButton}
+            onPress={() => navigation.navigate('Settings')}
+          >
+            <Text style={styles.headerButtonText}>设置</Text>
+          </Pressable>
+        </View>
       </View>
 
       <View style={styles.searchWrap}>
@@ -130,10 +192,14 @@ export default function ChatListScreen({ navigation }: Props) {
           }
           renderItem={({ item }) => {
             const count = unread[item.key] ?? item.unreadCount ?? 0;
+            const kind = classifyText(item.previewText, adRule, minorRule);
+            const preview = maskPreviewText(item.previewText, kind);
             return (
               <Pressable
                 style={({ pressed }) => [styles.row, pressed ? styles.rowPressed : null]}
                 onPress={() => onOpen(item)}
+                onLongPress={() => onLongPress(item)}
+                delayLongPress={350}
               >
                 <Avatar title={item.title} seed={item.key} unread={count} />
                 <View style={styles.rowBody}>
@@ -144,8 +210,11 @@ export default function ChatListScreen({ navigation }: Props) {
                     </Text>
                     <Text style={styles.rowTime}>{formatDialogTime(item.previewDate)}</Text>
                   </View>
-                  <Text style={styles.rowPreview} numberOfLines={1}>
-                    {item.previewText || '暂无消息'}
+                  <Text
+                    style={[styles.rowPreview, kind ? styles.rowPreviewFiltered : null]}
+                    numberOfLines={1}
+                  >
+                    {preview || '暂无消息'}
                   </Text>
                 </View>
               </Pressable>
@@ -179,6 +248,11 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 999,
     backgroundColor: colors.primarySoft,
+  },
+  headerButtons: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    alignItems: 'center',
   },
   headerButtonText: {
     color: colors.primaryDark,
@@ -230,6 +304,10 @@ const styles = StyleSheet.create({
     marginTop: 3,
     fontSize: 14,
     color: colors.textMuted,
+  },
+  rowPreviewFiltered: {
+    color: colors.textFaint,
+    fontStyle: 'italic',
   },
   separator: {
     height: StyleSheet.hairlineWidth,

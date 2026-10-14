@@ -47,9 +47,12 @@ jobs:
       - name: Install JS dependencies
         run: npm ci --no-audit --no-fund
 
-      # 先验证 polyfill 层与 JS 打包，几十秒就能拦住大部分回归，
+      # 先做静态与逻辑验证，几十秒就能拦住大部分回归，
       # 不用等 Gradle 跑完才发现问题
-      - name: Verify polyfills (crypto / TCP adapter)
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Verify polyfills & transport (crypto / TCP / proxy tunnel)
         run: npm run verify
 
       - name: Run unit tests

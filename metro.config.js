@@ -38,7 +38,8 @@ const nodeModuleShims = {
   store2: shim('store2.js'),
   'node-localstorage': shim('node-localstorage.js'),
 
-  // 未启用的通道：WebSocket 备用通道 / SOCKS 代理
+  // 代理隧道与通道选择：net 走 SOCKS5/SOCKS4/HTTP CONNECT（见 src/shims/tunnel.js），
+  // websocket 在切到 WebSocket 通道时被 GramJS 用来做 MTProto over wss
   websocket: shim('websocket.js'),
   socks: shim('socks.js'),
 

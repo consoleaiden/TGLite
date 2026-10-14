@@ -4,7 +4,14 @@
  * GramJS 的 extensions/PromisedWebSockets 用 `new w3cwebsocket(url, 'binary')` 做
  * MTProto-over-WebSocket。React Native 自带全局 WebSocket，这里做一个薄适配层。
  *
- * 说明：本客户端默认走 TCP（ConnectionTCPObfuscated），WebSocket 只是备用通道。
+ * 什么时候会走到这里：
+ *   设置页把「传输通道」切成 WebSocket 时（telegram.ts 会把 networkSocket 换成
+ *   PromisedWebSockets、useWSS 设成 true），GramJS 就会用
+ *   `wss://<dc-ip>:443/apiws` 建连。此时 TLS 由系统网络栈（Android 上是 OkHttp）
+ *   完成，所以这条路不需要任何原生加密模块。
+ *
+ * 也因此，WebSocket 通道用不了我们在 net shim 里自研的 SOCKS/HTTP 隧道——
+ * OkHttp 只认系统代理。设置页对这个组合有显式拦截。
  */
 function resolveWebSocketImpl() {
   const Impl = global.WebSocket;
