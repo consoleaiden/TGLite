@@ -1,4 +1,10 @@
-import { formatDialogTime, formatMessageDay, formatMessageTime, normalizePhone } from '../src/utils/format';
+import {
+  formatDialogTime,
+  formatMessageDay,
+  formatMessageTime,
+  looksLikeNetworkError,
+  normalizePhone,
+} from '../src/utils/format';
 
 /**
  * 时间格式化的实现用的是本地时区（date.getHours()），
@@ -118,5 +124,40 @@ describe('normalizePhone', () => {
 
   it('空输入返回空字符串', () => {
     expect(normalizePhone('   ')).toBe('');
+  });
+});
+
+describe('looksLikeNetworkError', () => {
+  it('识别常见的网络层错误', () => {
+    expect(looksLikeNetworkError(new Error('ETIMEDOUT'))).toBe(true);
+    expect(looksLikeNetworkError(new Error('connect ECONNREFUSED 149.154.167.51:443'))).toBe(true);
+    expect(looksLikeNetworkError(new Error('Network request failed'))).toBe(true);
+    expect(looksLikeNetworkError('socket hang up')).toBe(true);
+    expect(looksLikeNetworkError(new Error('Client network error'))).toBe(true);
+    expect(looksLikeNetworkError(new Error('连接超时'))).toBe(true);
+  });
+
+  it('识别 Telegram 用 errorMessage 抛出的连接类错误', () => {
+    expect(looksLikeNetworkError({ errorMessage: 'TIMEOUT' })).toBe(true);
+    expect(looksLikeNetworkError({ errorMessage: 'Connection closed' })).toBe(true);
+  });
+
+  it('业务错误码不误判（否则会错误地引导用户去配代理）', () => {
+    expect(looksLikeNetworkError(new Error('PHONE_NUMBER_INVALID'))).toBe(false);
+    expect(looksLikeNetworkError(new Error('API_ID_INVALID'))).toBe(false);
+    expect(looksLikeNetworkError(new Error('PHONE_CODE_EXPIRED'))).toBe(false);
+    expect(looksLikeNetworkError(new Error('SESSION_PASSWORD_NEEDED'))).toBe(false);
+  });
+
+  it('空值与无意义的输入返回 false', () => {
+    expect(looksLikeNetworkError(null)).toBe(false);
+    expect(looksLikeNetworkError(undefined)).toBe(false);
+    expect(looksLikeNetworkError('')).toBe(false);
+    expect(looksLikeNetworkError(new Error(''))).toBe(false);
+  });
+
+  it('大小写不敏感', () => {
+    expect(looksLikeNetworkError(new Error('etimedout'))).toBe(true);
+    expect(looksLikeNetworkError(new Error('Connection RESET by peer'))).toBe(true);
   });
 });

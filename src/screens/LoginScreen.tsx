@@ -4,6 +4,7 @@ import {
   KeyboardAvoidingView,
   Linking,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,6 +16,8 @@ import Button from '../components/Button';
 import { completeLogin } from '../boot';
 import { API_CREDENTIALS_URL, BUILTIN_API_HASH, BUILTIN_API_ID, TELEGRAM_DC_IPV4 } from '../config';
 import type { RootStackParamList } from '../navigation';
+import { transportLabel } from '../net/transport';
+import { useSettingsStore, describePreLoginNetwork } from '../settings';
 import {
   createClient,
   humanizeAuthError,
@@ -23,7 +26,7 @@ import {
   saveCredentials,
 } from '../tg/telegram';
 import { colors, radius, spacing } from '../theme';
-import { looksLikePhone, normalizePhone } from '../utils/format';
+import { looksLikeNetworkError, looksLikePhone, normalizePhone } from '../utils/format';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Login'>;
 
@@ -34,6 +37,11 @@ export default function LoginScreen({ navigation }: Props) {
   const [advanced, setAdvanced] = useState(!BUILTIN_API_ID);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // 代理状态要在这里显示：很多网络里没有代理根本连不上 Telegram，
+  // 得让用户在登录页就能看到当前有没有走代理、并一键去配置。
+  const proxy = useSettingsStore((state) => state.proxy);
+  const transport = useSettingsStore((state) => state.transport);
 
   useEffect(() => {
     (async () => {
@@ -48,6 +56,13 @@ export default function LoginScreen({ navigation }: Props) {
 
   const canSubmit =
     /^\d{4,12}$/.test(apiId.trim()) && apiHash.trim().length > 8 && looksLikePhone(phone) && !loading;
+
+  /**
+   * 登录页要表达的是「这份配置会不会走代理」，
+   * 而不是 proxyActuallyInUse()（那个读的是传输层实时状态，
+   * 只有在 createClient 之后才为真，登录前永远是 false，会误导人）。
+   */
+  const netHint = describePreLoginNetwork(transport, proxy);
 
   async function handleSendCode() {
     setError(null);
@@ -68,6 +83,8 @@ export default function LoginScreen({ navigation }: Props) {
     try {
       const creds = { apiId: parsedId, apiHash: hash };
       await saveCredentials(creds);
+      // createClient 会在构造客户端时读取当前设置，
+      // 所以用户在登录页配好的代理/通道到这里就自动生效了
       await createClient(creds);
 
       const result = await requestLoginCode(normalized);
@@ -78,11 +95,17 @@ export default function LoginScreen({ navigation }: Props) {
       }
       navigation.navigate('Code', {
         phone: normalized,
-        phoneCodeHash: result.phoneCodeHash,
         isCodeViaApp: result.isCodeViaApp,
+        phoneCodeHash: result.phoneCodeHash,
       });
     } catch (err) {
       setError(humanizeAuthError(err));
+      // 建连阶段的失败往往就是网络不通，顺手把用户引导到代理设置
+      if (looksLikeNetworkError(err)) {
+        setError(
+          `${humanizeAuthError(err)}\n\n如果所在网络无法直连 Telegram，请点下面的「网络与代理」配置代理或切换通道后重试。`,
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -165,6 +188,29 @@ export default function LoginScreen({ navigation }: Props) {
             disabled={!canSubmit}
             style={styles.submit}
           />
+        </View>
+
+        <View style={styles.netCard}>
+          <View style={styles.netText}>
+            <Text style={styles.netTitle}>网络与代理</Text>
+            <Text style={styles.netValue}>
+              {proxy.enabled
+                ? `${proxy.kind.toUpperCase()} ${proxy.host || '(未填地址)'}:${proxy.port || '-'}`
+                : '未启用代理'}
+              {` · 通道 ${transportLabel(transport)}`}
+            </Text>
+            <Text style={[styles.netHint, netHint.warning ? styles.netHintWarn : null]}>
+              {netHint.message}
+            </Text>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => navigation.navigate('Network', { preLogin: true })}
+            hitSlop={12}
+            style={styles.netAction}
+          >
+            <Text style={styles.netActionText}>去配置</Text>
+          </Pressable>
         </View>
 
         <View style={styles.footer}>
@@ -278,5 +324,49 @@ const styles = StyleSheet.create({
     color: colors.textFaint,
     lineHeight: 18,
     textAlign: 'center',
+  },
+  netCard: {
+    marginTop: spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.md,
+  },
+  netText: {
+    flex: 1,
+  },
+  netTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  netValue: {
+    marginTop: 2,
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  netHint: {
+    marginTop: 4,
+    fontSize: 11,
+    lineHeight: 16,
+    color: colors.textFaint,
+  },
+  netHintWarn: {
+    color: colors.danger,
+  },
+  netAction: {
+    paddingVertical: 6,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radius.sm,
+    backgroundColor: colors.primarySoft,
+  },
+  netActionText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.primaryDark,
   },
 });

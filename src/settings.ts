@@ -144,3 +144,60 @@ export function validateProxy(proxy: ProxySetting): string | null {
   }
   return null;
 }
+
+/**
+ * 给「登录前」的网络状态算一句话描述。
+ *
+ * 为什么需要它：登录页不能用 proxyActuallyInUse()——
+ * 那个读的是传输层 shim 的实时状态，而 shim 只在 createClient() 里被写入，
+ * 登录前永远是 false，会让人以为配了代理也没生效。
+ * 登录页真正要回答的是「这份配置在建连时会不会走代理」，
+ * 那就应该只看设置本身。
+ *
+ * 纯函数且不依赖 RN / GramJS，方便单测。
+ */
+export interface PreLoginNetworkHint {
+  /** 建连时是否会真的走代理 */
+  willUseProxy: boolean;
+  /** 需要提醒用户的问题（比如通道和代理冲突），没有则为 null */
+  warning: string | null;
+  /** 一句话说明，直接显示在登录页 */
+  message: string;
+}
+
+export function describePreLoginNetwork(
+  transport: TransportKind,
+  proxy: ProxySetting,
+): PreLoginNetworkHint {
+  const invalid = proxy.enabled ? validateProxy(proxy) : null;
+
+  if (!proxy.enabled) {
+    return {
+      willUseProxy: false,
+      warning: null,
+      message: '未启用代理，将直连 Telegram。若所在网络无法直连，请先点「去配置」。',
+    };
+  }
+
+  if (invalid) {
+    return {
+      willUseProxy: false,
+      warning: invalid,
+      message: `代理配置有误（${invalid}），登录时会退回直连。`,
+    };
+  }
+
+  if (!proxySupportsTransport(proxy, transport)) {
+    return {
+      willUseProxy: false,
+      warning: 'WebSocket 通道下代理不会生效。',
+      message: '当前是 WebSocket 通道，代理不会生效。要代理请把通道切成 TCP。',
+    };
+  }
+
+  return {
+    willUseProxy: true,
+    warning: null,
+    message: `登录时会走 ${proxy.kind.toUpperCase()} ${proxy.host.trim()}:${proxy.port} 建连。`,
+  };
+}

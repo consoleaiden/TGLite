@@ -5,6 +5,13 @@ module.exports = {
   // 注意：时区敏感的用例正确写法是用「本地时间构造 + 本地时间断言」，
   // 而不是硬编码某个时区的字面结果。
   setupFiles: ['<rootDir>/test-utils/setup.js'],
+  // AsyncStorage 是原生模块，jest 里直接加载会抛
+  // "NativeModule: AsyncStorage is null"。用内存替身顶掉，
+  // 这样 import 了 settings.ts 的纯逻辑也能被测。
+  moduleNameMapper: {
+    '^@react-native-async-storage/async-storage$':
+      '<rootDir>/test-utils/async-storage-mock.js',
+  },
   // 只把 *.test.* / *.spec.* 当测试文件。
   // 否则 __tests__/ 下的辅助文件（如 setup）会被当作空测试套件，
   // 报 "Your test suite must contain at least one test"。

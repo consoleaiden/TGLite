@@ -76,6 +76,12 @@ export default function RootNavigator() {
             <Stack.Screen name="Login" component={LoginScreen} />
             <Stack.Screen name="Code" component={CodeScreen} />
             <Stack.Screen name="Password" component={PasswordScreen} />
+            {/*
+              登录前也要能配代理：在没有代理就打不开 Telegram 的网络里，
+              用户连登录页都过不去。preLogin 参数让这个页面知道
+              当前没有客户端、保存时只落盘不重连。
+            */}
+            <Stack.Screen name="Network" component={NetworkScreen} />
           </>
         )}
       </Stack.Navigator>

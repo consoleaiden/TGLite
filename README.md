@@ -44,6 +44,8 @@
 - **未成年保护**：本地关键词过滤，命中消息彻底不显示（连折叠提示都不留）
 - **SOCKS5 / SOCKS4 / HTTP 代理**：自研纯 JS 隧道，支持用户名密码 / Basic 认证，带连通性自检
 - **WebSocket 备用通道**：TCP 被封锁时可切到 MTProto over `wss://<dc>:443/apiws`
+- **登录页也能配代理**：登录页直接显示当前代理状态并一键进入配置，
+  避免"没有代理就打不开 Telegram、连登录页都过不去"的死循环
 - 会话字符串持久化（重启免登录）、退出登录（含服务端注销）
 
 暂未实现（有意留白）：
@@ -197,12 +199,18 @@ TGLite/
     │   ├── links.ts             # ⭐ 加入目标解析（@用户名 / 邀请链接）
     │   └── bus.ts               # 新消息事件总线
     ├── components/              # Avatar / Button / MessageBubble / MediaBlock /
-    │                            # Switch / TextField
+    │                            # ProxyPanel（登录页与设置页共用）/ Switch / TextField
     ├── screens/                 # Login / Code / Password / ChatList / Chat /
     │                            # ChatInfo / Join / Settings / Filters / Network /
     │                            # Forward / Comments / ApiCredentials
     └── utils/format.ts
 ```
+
+> 📌 写测试时的经验：**纯逻辑要放在不 import `react-native` / `telegram` 的模块里**，
+> 否则 jest 一加载就会因为原生模块（AsyncStorage）或 GramJS 初始化而失败。
+> 所以 `media.ts` / `filters.ts` / `links.ts` / `format.ts` 的纯函数、以及
+> `settings.ts` 的 `describePreLoginNetwork()` 才能被直接单测。
+> AsyncStorage 用 `test-utils/async-storage-mock.js` + `moduleNameMapper` 顶掉。
 
 ### 6.2 GramJS 在 React Native 上的三个坑（都已在代码里解决）
 
@@ -253,6 +261,35 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
   握手响应之后若还有残留字节，会补发成 socket 的第一段 `data`
 - ⚠️ **WebSocket 通道不支持自建代理**：那条路走的是 OkHttp，插不进我们的隧道。
   设置页对这个组合有显式拦截（保存时提示二选一），`createClient` 里也会把代理置空并给出警告
+
+#### 登录前也要能配代理（否则会陷入死循环）
+
+这是实际使用中必须解决的问题：**在没有代理就打不开 Telegram 的网络里，
+用户连登录页都过不去**——App 装了等于没用。所以登录页有一张「网络与代理」卡片，
+显示当前代理/通道状态，并提供「去配置」入口直接进入同一个配置页。
+
+实现上有个关键约束：**登录前没有客户端**。
+
+- `reconnectClient()` 在没有会话时会抛「会话已失效，请重新登录」，登录前根本不能调
+- 而代理真正生效的时间点是 `createClient()` 内部的
+  `applyTransportSettings(currentSettings())`——它在 `new TelegramClient` **之前**读取设置，
+  因为 GramJS 会在构造函数里就把 `networkSocket` 定下来，之后再改无效
+
+所以两处共用同一个 `ProxyPanel` 组件，只有保存动作不同：
+
+| 入口 | 保存后做什么 | 说明 |
+| --- | --- | --- |
+| 登录页（`preLogin: true`） | 只把配置落盘 | 用户点「获取验证码」时 `createClient` 会读到并生效 |
+| 设置页 | 落盘 + `reconnectClient()` 重连 | 已经有连接，必须断了重连才生效 |
+
+配套的两个细节：
+
+- 登录页**不能**用 `proxyActuallyInUse()` 判断代理状态——那个读的是传输层 shim 的实时状态，
+  只在 `createClient()` 里被写入，登录前恒为 `false`，会误导用户以为"配了也没生效"。
+  登录页要回答的是"这份配置建连时会不会走代理"，所以用 `describePreLoginNetwork()`
+  只看设置本身（顺带把通道冲突、配置非法这些情况一起说清）
+- 登录失败时用 `looksLikeNetworkError()` 只对**网络层**错误追加"去配代理"的引导；
+  `PHONE_NUMBER_INVALID` / `API_ID_INVALID` 这类业务错误不会误导用户去折腾代理
 
 ### 6.4 内容过滤（广告 / 未成年保护）
 
@@ -353,6 +390,15 @@ A：可以。设置页 → 「接入信息」→「切换 API 凭据」可以查
 
 **Q：提示 `PHONE_NUMBER_INVALID`**
 A：手机号要带国家码，例如 `+8613800138000`。
+
+**Q：卡在「获取验证码」，或者提示连接超时 / Network request failed**
+A：多半是当前网络直连不上 Telegram。**登录页就有「网络与代理」卡片**，
+点「去配置」可以直接设置 SOCKS5 / SOCKS4 / HTTP 代理，或把通道切成 WebSocket，
+然后用「测试连通性」确认隧道能打通再返回登录。登录前保存的配置会在点「获取验证码」时立即生效。
+
+**Q：登录页显示「未启用代理」，但我明明配过了**
+A：看下卡片上的通道说明。如果当前是 **WebSocket 通道**，自建代理是不生效的
+（该通道走系统网络栈），卡片会直接标红提示，把通道切回 TCP 即可。
 
 **Q：CI 编译失败在 Gradle 阶段**
 A：先确认 JDK 是 17；再确认 `npm ci` 用的是仓库里的 `package-lock.json`。
