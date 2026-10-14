@@ -27,6 +27,11 @@ jobs:
     env:
       # 显式关闭 Gradle daemon：CI 是单次进程，daemon 只会白占内存
       GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g
+      # 固定时区：runner 默认 UTC，而本机开发常在 UTC+8。
+      # 时间相关的测试/快照在不同时区会出现「本地绿、CI 红」，
+      # 这里统一成 UTC，让本地与 CI 行为一致（时区敏感的用例
+      # 应自行用本地时间构造输入，而不是依赖运行机器时区）。
+      TZ: UTC
 
     steps:
       - name: Checkout
