@@ -1,0 +1,24 @@
+# 统一行尾为 LF，避免 Windows 上编辑过的 `android/gradlew` 在 Linux CI 上执行失败
+* text=auto eol=lf
+
+# 二进制文件不要做行尾/编码转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.jar binary
+*.keystore binary
+*.jks binary
+*.aab binary
+*.so binary
+*.hbc binary
+
+# Gradle wrapper 必须以 LF 存储
+gradlew text eol=lf
+
+# 锁文件与生成物保持原样，减少无意义 diff
+package-lock.json -diff
