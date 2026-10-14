@@ -32,6 +32,17 @@ jobs:
       # 这里统一成 UTC，让本地与 CI 行为一致（时区敏感的用例
       # 应自行用本地时间构造输入，而不是依赖运行机器时区）。
       TZ: UTC
+      # 缓存归档里记录的属主可能是 root（归档方解包时会尝试 chown），
+      # 而 actions/cache 是以 runner 普通用户身份调 tar 解包的，chown 必然失败：
+      #   tar: ...: Cannot utime: Operation not permitted
+      #   tar: ...: Cannot change mode to rwxr-xr-x: Operation not permitted
+      #   tar: Exiting with failure status due to previous errors   ← exit code 2
+      # --no-same-owner 让解包出来的文件归当前用户所有，不再尝试改属主。
+      # GNU tar 会把这个环境变量当作默认命令行选项，且显式参数仍可覆盖它。
+      TAR_OPTIONS: --no-same-owner
+      # NDK 缓存的落地中转目录。故意不用镜像里那个 root 属主的 SDK 目录，
+      # 见下方 "Cache Android NDK" 步骤的说明。
+      NDK_CACHE_DIR: ${{ github.workspace }}/.ndk-cache
 
     steps:
       - name: Checkout
@@ -92,12 +103,29 @@ jobs:
       # 缓存 NDK：Android 官方 NDK 包约 630MB，
       # 镜像是「随镜像更新滚动」的，某次更新后就可能不再预装项目锁定的版本，
       # 每次重下很浪费时间。键里带上版本号，升 NDK 时自动换缓存。
-      # 路径写死镜像常量：actions/cache 的 with 不做运行时 env 插值，
-      # 写 ${{ env.ANDROID_HOME }} 会取到空值。
+      #
+      # 为什么缓存目录不是 $ANDROID_HOME/ndk 本体？
+      # 之前直接缓存 /usr/local/lib/android/sdk/ndk（镜像预装路径），
+      # 恢复时必然报：
+      #   Failed to restore: "/usr/bin/tar" failed with error:
+      #   The process '/usr/bin/tar' failed with exit code 2
+      # 原因是那棵目录树属主是 root/packer，而 actions/cache 以 runner 用户
+      # 调 `tar -P -C <原路径>` 解包，归档里带着 root 属主信息，
+      # tar 会去 chown/chmod/chutime，全都 EPERM：
+      #   Cannot utime: Operation not permitted
+      #   Cannot change mode to rwxr-xr-x: Operation not permitted
+      # 解包一旦报错，actions/cache 就把整次恢复判为失败 → 缓存等于没用，
+      # 每次构建仍要重装 630MB。runner-images / cypress 都有同类 issue。
+      #
+      # 改成缓存一个我们自己创建的、归 runner 所有的中转目录：
+      # 属主一致，tar 解包不会碰到权限问题；再由下一步把内容「拷」进 SDK。
+      # 这条路径在 workspace 下，默认就属于 runner。
+      # 不写 ${{ env.ANDROID_HOME }}：actions/cache 的 with 不做运行时 env 插值，
+      # 取到的是空值，路径会变成 "/ndk" 这种错误位置。
       - name: Cache Android NDK
         uses: actions/cache@v4
         with:
-          path: /usr/local/lib/android/sdk/ndk
+          path: ${{ github.workspace }}/.ndk-cache
           key: ndk-${{ runner.os }}-26.1.10909125
 
       # 项目锁定 NDK 26.1.10909125（RN 0.75 模板的对应版本）。
@@ -109,6 +137,10 @@ jobs:
           set -euo pipefail
           # 路径由上一步写入 GITHUB_ENV
           : "${SDKMANAGER:?上一步未导出 SDKMANAGER}"
+          # NDK 缓存中转目录来自 job env。这里显式校验：set -u 下它若缺失，
+          # 原生报错是一句没头没尾的 "NDK_CACHE_DIR: unbound variable"，
+          # 排查时看不出是 env 漏配。给一句能直接指向原因的提示。
+          : "${NDK_CACHE_DIR:?job env 缺少 NDK_CACHE_DIR，检查 workflow 顶部的 env 块}"
 
           # grep -oP 需要 PCRE（GNU grep 默认带），失败时退回 sed，双保险
           NDK_VERSION="$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' android/build.gradle 2>/dev/null | head -1 || true)"
@@ -141,12 +173,26 @@ jobs:
             fi
           done
 
+          # ---- NDK：优先吃缓存中转目录，其次现装 ----
+          # $NDK_CACHE_DIR 由 job env 提供（workspace 下的 .ndk-cache）。
+          # 命中缓存时里面已经有 ndk/<版本>/，直接拷进 SDK，
+          # 省掉 630MB 下载；未命中时照常装，装完再拷回中转目录供下次缓存。
+          NDK_MISSING=0
           if [ -n "${NDK_VERSION:-}" ]; then
             if [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
-              echo "[sdk] NDK $NDK_VERSION 已存在"
+              echo "[sdk] NDK $NDK_VERSION 已存在于 SDK 中"
+            elif [ -d "$NDK_CACHE_DIR/ndk/$NDK_VERSION" ]; then
+              echo "[sdk] 命中 NDK 缓存，从 $NDK_CACHE_DIR 拷入 SDK"
+              mkdir -p "$ANDROID_HOME/ndk"
+              # cp -a 保留符号链接与可执行位：NDK 里有大量 symlink，
+              # 用 cp -r 会把链接解引用成实体文件，体积暴涨且可能失效。
+              # 目标目录属主是我们自己（新建的），不会踩 root 属主的权限坑。
+              cp -a "$NDK_CACHE_DIR/ndk/$NDK_VERSION" "$ANDROID_HOME/ndk/"
+              echo "[sdk] NDK 缓存拷贝完成"
             else
-              echo "[sdk] NDK $NDK_VERSION 缺失，尝试安装"
+              echo "[sdk] NDK $NDK_VERSION 既不在 SDK 也不在缓存，需要安装"
               NEEDED="$NEEDED ndk;$NDK_VERSION"
+              NDK_MISSING=1
             fi
           fi
 
@@ -165,6 +211,16 @@ jobs:
             echo "当前 $ANDROID_HOME/ndk 下可用："
             ls -1 "$ANDROID_HOME/ndk" 2>/dev/null || true
             exit 1
+          fi
+
+          # 现装出来的 NDK 回填到缓存中转目录，供 cache 步骤在 job 结束时保存。
+          # 只回填，不动 SDK 里的原件——SDK 那棵树的属主不是 runner，
+          # 对它做任何写属主的操作都会再次引入 tar 解包失败的老问题。
+          if [ "${NDK_MISSING:-0}" = "1" ] && [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+            echo "[sdk] 回填 NDK 到缓存中转目录 $NDK_CACHE_DIR"
+            mkdir -p "$NDK_CACHE_DIR/ndk"
+            cp -a "$ANDROID_HOME/ndk/$NDK_VERSION" "$NDK_CACHE_DIR/ndk/"
+            echo "[sdk] 回填完成，下次构建将命中缓存"
           fi
           echo "[sdk] 组件安装完成"
 
