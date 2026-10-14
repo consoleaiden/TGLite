@@ -33,16 +33,23 @@
 - 实时新消息推送（会话列表即时置顶 + 未读红点，聊天页即时上屏）
 - **群组 / 频道管理**：查看基本信息与成员列表、改标题与简介、退出群组/频道、解散频道
 - **加入群组 / 频道**：支持 `@username`、`t.me/<name>`、`t.me/+<邀请码>`、`t.me/joinchat/<码>`，加入前先预览
+- **回复与引用**：长按消息回复，输入框上方显示回复条；收到的回复会渲染成引用块，点击可跳回原消息
+- **媒体消息**：图片/视频/文件/语音/贴纸/网页预览的解析与渲染，图片按原始比例惰性加载
+- **媒体发送**：从相册或文件里选图/选文件直接发送，可带文字说明、可回复某条消息
+- **转发**：单条转发；多选批量转发；**整组（相册）转发**——选一条即把同相册的消息一起带走
+- **消息操作**：长按菜单支持回复 / 转发 / 多选 / 删除（自己发的可撤回）
+- **评论区**：频道帖子可查看评论列表并直接发评论
+- **切换 API 凭据**：设置页可查看 / 修改 `api_id` 与 `api_hash`，改完引导重新登录
 - **广告过滤**：本地关键词过滤，命中消息折叠为「广告消息已过滤」，点击可展开/收起，默认隐藏
 - **未成年保护**：本地关键词过滤，命中消息彻底不显示（连折叠提示都不留）
 - **SOCKS5 / SOCKS4 / HTTP 代理**：自研纯 JS 隧道，支持用户名密码 / Basic 认证，带连通性自检
 - **WebSocket 备用通道**：TCP 被封锁时可切到 MTProto over `wss://<dc>:443/apiws`
 - 会话字符串持久化（重启免登录）、退出登录（含服务端注销）
 
-暂未实现（有意留白，避免引入文件系统 / 媒体下载带来的复杂度）：
+暂未实现（有意留白）：
 
-- 图片、视频、文件、语音的收发与下载
-- 转发、回复、编辑、删除消息
+- 视频/大文件的落盘下载与「保存到相册」（目前图片在内存里按需加载）
+- 消息编辑、表情回应、投票
 - 多账号、通话、MTProto 专用代理（MTProxy）
 
 ---
@@ -182,13 +189,18 @@ TGLite/
     ├── navigation.ts
     ├── RootNavigator.tsx
     ├── tg/
-    │   ├── telegram.ts          # ⭐ MTProto 客户端封装（登录 / 会话 / 消息）
+    │   ├── telegram.ts          # ⭐ MTProto 客户端封装（登录 / 会话 / 消息 / 转发 / 评论）
+    │   ├── media.ts             # ⭐ 媒体解析 + 相册 id + 讨论组定位（纯函数，可单测）
+    │   ├── media-transfer.ts    # ⭐ 媒体上传 / 下载（RN 下走 buffer，不用 path）
+    │   ├── pickers.ts           # ⭐ 相册 / 文件选择器封装
     │   ├── groups.ts            # ⭐ 群组与频道管理（加入 / 退出 / 成员 / 改名）
     │   ├── links.ts             # ⭐ 加入目标解析（@用户名 / 邀请链接）
     │   └── bus.ts               # 新消息事件总线
-    ├── components/              # Avatar / Button / MessageBubble / Switch / TextField
+    ├── components/              # Avatar / Button / MessageBubble / MediaBlock /
+    │                            # Switch / TextField
     ├── screens/                 # Login / Code / Password / ChatList / Chat /
-    │                            # ChatInfo / Join / Settings / Filters / Network
+    │                            # ChatInfo / Join / Settings / Filters / Network /
+    │                            # Forward / Comments / ApiCredentials
     └── utils/format.ts
 ```
 
@@ -279,6 +291,50 @@ Telegram 的历史包袱在这里绕不开，`src/tg/groups.ts` 对每个写操�
 - 「加入」的入口有两条：`@username` 走 `contacts.ResolveUsername` + `channels.JoinChannel`；
   邀请链接走 `messages.CheckChatInvite`（先预览，能提前知道是否需要管理员审批）+ `messages.ImportChatInvite`
 
+### 6.6 媒体、转发与评论区的几个暗坑
+
+**① RN 里没有文件路径，上传只能走 buffer。**
+GramJS 的 `CustomFile(name, size, path, buffer)` 支持两种模式，RN 拿不到稳定 `path`，
+所以 `media-transfer.ts` 统一走：`fetch(uri)` → `arrayBuffer()` → `Buffer.from(...)` → `CustomFile`。
+选择器那边用 `copyTo: 'cachesDirectory'`，因为 `content://` 这类 uri 不一定能被 `fetch` 读到。
+
+**② 相册（消息组）转发要凑齐同一个 `groupedId`。**
+Telegram 把一条消息组里每条消息都带上同一个 `groupedId`（bigInt）。
+「整组转发」的做法是把同 `groupedId` 的 id 全部收集起来一次性传给 `messages.forwardMessages`
+——只有一批 id 一起发过去，服务端才会还原成相册。
+这段核心逻辑放在 `media.ts` 的 `collectGroupedIds()`（纯函数），有单测覆盖。
+
+**③ 频道帖子的评论，id 是两套。**
+这是最容易写错的一处：频道帖子（channel post）存在于**频道**里，
+而它的评论线程存在于**关联讨论组**（一个 megagroup）里，两者消息 id 完全不同。
+
+- `messages.GetDiscussionMessage({ peer: <频道>, msgId: <帖子 id> })` —— 这里的 `peer` 是**频道**，正确
+- 它返回的 `messages` 里 id 最小的那条，就是帖子在讨论组中的「起始消息」
+- 之后 `messages.GetReplies` 和 `sendMessage` 的 `commentTo`，要用的都是**这个** id 和**讨论组**的 peer
+
+一开始我直接把频道帖子 id 当作讨论组 id 用，是错的（会拿不到评论、评论也发不进去）。
+现在的实现放在 `telegram.ts` 的 `resolveDiscussion()`，
+与 GramJS 内部 `client/messages.js` 的 `getCommentData` 保持一致，
+拆出来的 `pickDiscussionAnchorId()` / `pickDiscussionChat()` 是纯函数，同样有单测。
+
+> 💡 一个顺手发现的坑：`Number(null) === 0` 且 `Number.isFinite(0)` 为真。
+> 如果只判 `isFinite`，一条 `{ id: null }` 就会让最小值变成 `0`，
+> 于是 `msgId` 变成 0、请求必然失败。所以判定必须同时要求正整数。
+> 这个是写测试时才发现的。
+
+**④ 媒体权限只在旧系统上申请。**
+`react-native-image-picker` / `react-native-document-picker` 自身都不声明存储权限，
+需要我们在 `AndroidManifest.xml` 里补。Android 13（API 33）起系统用照片选择器和
+SAF 文档选择器，**选文件不需要任何权限**，所以权限都加了 `maxSdkVersion` 限制：
+
+| 权限 | maxSdkVersion | 原因 |
+| --- | --- | --- |
+| `READ_EXTERNAL_STORAGE` | 32 | Android ≤12 读相册媒体才需要 |
+| `WRITE_EXTERNAL_STORAGE` | 28 | Android ≤9 额外需要 |
+
+运行时申请放在 `pickers.ts` 的 `ensureMediaPermission()`：
+API ≥33 直接返回 true，不弹窗；旧系统才真的去 request。
+
 ---
 
 ## 7. 常见问题
@@ -288,6 +344,12 @@ A：`react-native-get-random-values` 是原生模块，改动原生代码后必�
 
 **Q：提示 `API_ID_INVALID` 或 `API_ID_PUBLISHED_FLOOD`**
 A：api_id/api_hash 用错了，或者用的是网上公开的那一份。去 my.telegram.org 重新申请一份自用。
+
+**Q：装好的 APK 里可以直接换 api_id / api_hash 吗？**
+A：可以。设置页 → 「接入信息」→「切换 API 凭据」可以查看和修改。
+也可以一开始就不编译进 APK（不配 Secrets 即可），装好后在 App 内填。
+注意：凭据代表「应用身份」，换掉之后旧会话在服务端就不再匹配，
+所以保存后会引导重新用手机号登录一次。
 
 **Q：提示 `PHONE_NUMBER_INVALID`**
 A：手机号要带国家码，例如 `+8613800138000`。

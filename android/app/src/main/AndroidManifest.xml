@@ -2,6 +2,23 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+      媒体选择器（相册 / 文件）需要的读取权限。
+
+      Android 13（API 33）起系统改用「照片选择器」和 SAF 文档选择器，
+      选文件不需要任何权限，所以这里用 maxSdkVersion 把权限限制在旧系统，
+      在新系统上就不会多出一条无意义的授权弹窗。
+
+      Android 10–12：需要 READ_EXTERNAL_STORAGE 才能读到相册里的媒体。
+      Android 9 及以下：额外需要 WRITE_EXTERNAL_STORAGE。
+    -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <application
       android:name=".MainApplication"
       android:label="@string/app_name"

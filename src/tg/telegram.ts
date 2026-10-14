@@ -9,6 +9,13 @@ import { StringSession } from 'telegram/sessions';
 import { APP_VERSION, BOOTSTRAP_DC, DIALOG_FETCH_LIMIT, MESSAGE_FETCH_LIMIT } from '../config';
 import { applyTransportSettings, type TransportPlan } from '../net/transport';
 import { currentSettings } from '../settings';
+import {
+  groupedIdOf,
+  parseMedia,
+  pickDiscussionAnchorId,
+  pickDiscussionChat,
+  type MediaInfo,
+} from './media';
 
 const SESSION_KEY = '@tglite/session_v1';
 const CREDENTIALS_KEY = '@tglite/credentials_v1';
@@ -46,6 +53,31 @@ export interface ChatMessage {
   kind: 'text' | 'media' | 'service';
   pending?: boolean;
   failed?: boolean;
+  /** 媒体信息（图片/视频/文件/贴纸等），纯文本消息为 null */
+  media?: MediaInfo | null;
+  /** 被回复的那条消息（引用块要展示的内容） */
+  replyTo?: ReplyPreview | null;
+  /** 消息组（相册）ID，同一批多图/多视频共享，用于整体转发 */
+  groupedId?: string | null;
+  /** 转发来源（转发消息才有的"转自 xxx"） */
+  forwardFrom?: string | null;
+  /** 该消息所在讨论组里的评论条数（频道帖子） */
+  replyCount?: number;
+  /** 频道帖子是否有评论区（有则显示"查看评论"入口） */
+  commentsPeer?: { peerKey: string; msgId: string } | null;
+  /** 发送者显示名（群聊里需要区分人） */
+  senderName?: string;
+}
+
+/** 引用块展示所需的最小信息 */
+export interface ReplyPreview {
+  id: string;
+  /** 被回复消息的正文（可能为空，比如对方发的是图片） */
+  text: string;
+  /** 被回复消息的发送者 */
+  senderName: string;
+  /** 被回复的是不是自己发的 */
+  out: boolean;
 }
 
 let client: TelegramClient | null = null;
@@ -465,11 +497,229 @@ export async function loadOlderMessages(
     .filter((message): message is ChatMessage => message !== null);
 }
 
-export async function sendTextMessage(peerKey: string, text: string): Promise<ChatMessage | null> {
+export async function sendTextMessage(
+  peerKey: string,
+  text: string,
+  replyToId?: string,
+): Promise<ChatMessage | null> {
   const tg = getClient();
   const peer = await resolvePeer(peerKey);
-  const sent: any = await tg.sendMessage(peer, { message: text });
+  const sent: any = await tg.sendMessage(peer, {
+    message: text,
+    // 传数字 id 才会被当成 reply_to；传 undefined 表示普通消息
+    replyTo: replyToId ? Number(replyToId) : undefined,
+  });
   return toChatMessage(sent);
+}
+
+// ---------------------------------------------------------------------------
+// 消息操作：编辑 / 删除 / 转发
+// ---------------------------------------------------------------------------
+
+/** 编辑自己发过的文本消息 */
+export async function editMessageText(
+  peerKey: string,
+  messageId: string,
+  text: string,
+): Promise<ChatMessage | null> {
+  const tg = getClient();
+  const peer = await resolvePeer(peerKey);
+  const edited: any = await tg.editMessage(peer, {
+    message: Number(messageId),
+    text,
+  });
+  return toChatMessage(edited);
+}
+
+/**
+ * 删除消息。
+ * revoke=true 会对所有人生效（仅自己发的或自己是管理员时可用）；
+ * revoke=false 只删自己这边的记录。
+ */
+export async function deleteMessages(
+  peerKey: string,
+  messageIds: string[],
+  revoke = true,
+): Promise<void> {
+  const tg = getClient();
+  const peer = await resolvePeer(peerKey);
+  await tg.deleteMessages(peer, messageIds.map(Number), { revoke });
+}
+
+/**
+ * 转发消息到一个或多个目标会话。
+ * 传入多个 messageId 时，Telegram 会把它们作为一组转发；
+ * 相册（消息组）整体转发就是靠这个：把同一 groupedId 的所有 id 一起传。
+ */
+export async function forwardMessages(
+  fromPeerKey: string,
+  messageIds: string[],
+  toPeerKeys: string[],
+): Promise<void> {
+  if (!messageIds.length || !toPeerKeys.length) return;
+  const tg = getClient();
+  const from = await resolvePeer(fromPeerKey);
+  const ids = messageIds.map(Number);
+
+  for (const targetKey of toPeerKeys) {
+    const to = await resolvePeer(targetKey);
+    await tg.forwardMessages(to, {
+      messages: ids,
+      fromPeer: from,
+    });
+  }
+}
+
+// 「消息组整体转发」需要挑出同相册的全部 id，
+// 实现放在 media.ts（纯函数）以便脱离 RN 环境单测，这里转发出去
+export { collectGroupedIds } from './media';
+
+// ---------------------------------------------------------------------------
+// 评论（频道帖子的关联讨论组）
+// ---------------------------------------------------------------------------
+
+export interface CommentItem {
+  id: string;
+  text: string;
+  date: number;
+  senderName: string;
+  out: boolean;
+  media?: MediaInfo | null;
+}
+
+/**
+ * 找到频道帖子对应的「讨论组」以及帖子在讨论组里的消息 id。
+ *
+ * 这里有个容易踩的坑：频道帖子本身只存在于频道里，
+ * 而它的评论线程存在于关联讨论组（一个 megagroup）里，
+ * 两者是两套 id。GetDiscussionMessage 返回的 messages 里那条
+ * 「讨论组中的起始消息」的 id 才是后续要用到的 id，
+ * 直接拿频道帖子的 id 去 getReplies / commentTo 都会失败。
+ *
+ * 这段逻辑与 GramJS 内部 client/messages.js 的 getCommentData 保持一致。
+ */
+async function resolveDiscussion(
+  peerKey: string,
+  msgId: string,
+): Promise<{ peer: any; msgId: number } | null> {
+  const tg = getClient();
+  const result: any = await tg.invoke(
+    new Api.messages.GetDiscussionMessage({
+      peer: await getInputEntity(peerKey),
+      msgId: Number(msgId),
+    }),
+  );
+
+  const messages: any[] = result?.messages || [];
+  const chats: any[] = result?.chats || [];
+
+  const anchorId = pickDiscussionAnchorId(messages);
+  if (anchorId === null) return null;
+
+  const anchor = messages.find((m: any) => Number(m?.id) === anchorId);
+  const chat = pickDiscussionChat(chats, anchor);
+  if (!chat) return null;
+
+  return { peer: await tg.getInputEntity(chat), msgId: anchorId };
+}
+
+/**
+ * 拉取某个频道帖子的评论。
+ *
+ * 评论存放在帖子的「关联讨论组」里，所以先解析出讨论组，
+ * 再用 messages.getReplies 按讨论组里的消息 id 拉取。
+ */
+export async function loadComments(
+  peerKey: string,
+  msgId: string,
+  limit = 50,
+): Promise<CommentItem[]> {
+  const tg = getClient();
+  const discussion = await resolveDiscussion(peerKey, msgId);
+  if (!discussion) {
+    // 帖子没开评论，或不是频道帖子 —— 当成「暂无评论」，不当作错误
+    return [];
+  }
+
+  const result: any = await tg.invoke(
+    new Api.messages.GetReplies({
+      peer: discussion.peer,
+      msgId: discussion.msgId,
+      offsetId: 0,
+      offsetDate: 0,
+      addOffset: 0,
+      limit,
+      maxId: 0,
+      minId: 0,
+      hash: BigInt(0) as any,
+    }),
+  );
+
+  const rawList: any[] = (result as any)?.messages || [];
+  const users: any[] = (result as any)?.users || [];
+  const userById = new Map<string, any>();
+  for (const user of users) userById.set(String(user.id), user);
+
+  const items: CommentItem[] = [];
+  for (const message of rawList) {
+    // getReplies 会把讨论组里那条「起始消息」（即帖子本身）也放进来，跳过它
+    if (String(message?.id) === String(discussion.msgId)) continue;
+    if (!message || message.className === 'MessageEmpty') continue;
+
+    const senderId = String(message.fromId?.userId ?? '');
+    const sender = userById.get(senderId);
+    const name = sender
+      ? [sender.firstName, sender.lastName].filter(Boolean).join(' ').trim() || sender.username
+      : '';
+
+    const text = String(message.message || '').trim();
+    const media = parseMedia(message);
+    items.push({
+      id: String(message.id),
+      text: text || mediaLabel(message),
+      date: Number(message.date || 0),
+      senderName: name || '未知用户',
+      out: !!message.out,
+      media,
+    });
+  }
+  return items;
+}
+
+/**
+ * 判断一个会话是否是「频道」——只有频道帖子才有评论区。
+ */
+export async function isChannelPeer(peerKey: string): Promise<boolean> {
+  try {
+    const entity: any = await resolveEntity(peerKey);
+    return !!entity?.broadcast;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 在频道帖子的评论区发一条评论。
+ *
+ * 评论要发到「关联讨论组」，并且 commentTo 必须指向
+ * 帖子在讨论组里的那条起始消息 id（不是频道帖子的 id），
+ * Telegram 才会把它正确归到该帖的评论线程里。
+ */
+export async function sendComment(
+  peerKey: string,
+  msgId: string,
+  text: string,
+): Promise<void> {
+  const tg = getClient();
+  const discussion = await resolveDiscussion(peerKey, msgId);
+  if (!discussion) {
+    throw new Error('这条帖子没有开放评论');
+  }
+
+  await tg.sendMessage(discussion.peer, {
+    message: text,
+    commentTo: discussion.msgId,
+  });
 }
 
 export async function markPeerRead(peerKey: string): Promise<void> {
@@ -564,16 +814,73 @@ function mediaLabel(message: any): string {
   return '[媒体]';
 }
 
+/** 从一个 peer 对象里取显示名，用于引用块里的「谁说了这句话」 */
+function displayNameOfPeer(entity: any): string {
+  if (!entity) return '';
+  const name = [entity.firstName, entity.lastName].filter(Boolean).join(' ').trim();
+  return entity.title || name || entity.username || '';
+}
+
+/** 解析被回复的那条消息，生成引用块需要的信息 */
+function toReplyPreview(raw: any): ReplyPreview | null {
+  const replied = raw?.replyTo;
+  if (!replied) return null;
+  const repliedMsg = replied.replyToMsgId !== undefined ? replied : null;
+  const msgId = repliedMsg ? repliedMsg.replyToMsgId : replied.replyToTopId;
+  if (!msgId) return null;
+
+  // GramJS 的 replyTo 只带 id，正文要另外查。
+  // 这里先给出占位，ChatScreen 拉到消息列表后会自动补全
+  // （同一条消息通常已在当前列表里）。
+  return {
+    id: String(msgId),
+    text: '',
+    senderName: '',
+    out: false,
+  };
+}
+
+/** 转发来源：频道/用户 的显示名 */
+function toForwardFrom(raw: any): string | null {
+  const fwd = raw?.fwdFrom;
+  if (!fwd) return null;
+  // 隐藏转发来源时 Telegram 会给 fromName，优先用它
+  if (fwd.fromName) return String(fwd.fromName);
+  if (fwd.fromId) {
+    const id = fwd.fromId;
+    if (id.userId !== undefined) return '用户';
+    if (id.channelId !== undefined) return '频道';
+    if (id.chatId !== undefined) return '群组';
+  }
+  return '转发的消息';
+}
+
 function toChatMessage(raw: any): ChatMessage | null {
   if (!raw) return null;
   const text = String(raw.message || raw.text || '').trim();
+  const media = parseMedia(raw);
   const label = text || mediaLabel(raw);
-  if (!label) return null;
+  // 纯文本为空的媒体消息也要显示，所以这里有 media 就放行
+  if (!label && !media) return null;
+
+  // 帖子开了评论区才有入口。真正的讨论组 peer 由 loadComments 内部解析，
+  // 这里只用来判断"要不要显示评论入口"。
+  const commentsPeer = raw.replies
+    ? { peerKey: String(raw.replies.channelId ?? ''), msgId: String(raw.id) }
+    : null;
+
   return {
     id: String(raw.id),
     out: !!raw.out,
     text: label,
     date: Number(raw.date || 0),
-    kind: text ? 'text' : raw.action ? 'service' : 'media',
+    kind: raw.action ? 'service' : media ? 'media' : 'text',
+    media,
+    replyTo: toReplyPreview(raw),
+    groupedId: groupedIdOf(raw),
+    forwardFrom: toForwardFrom(raw),
+    replyCount: Number(raw.replies?.replies || 0) || undefined,
+    commentsPeer,
+    senderName: raw.sender ? displayNameOfPeer(raw.sender) : undefined,
   };
 }

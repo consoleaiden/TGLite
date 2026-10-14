@@ -117,11 +117,19 @@ export default function SettingsScreen({ navigation }: Props) {
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>接入信息</Text>
-        <Row label="api_id" value={creds ? String(creds.apiId) : '未配置'} />
-        <Row
-          label="api_hash"
-          value={creds ? `${creds.apiHash.slice(0, 6)}${'*'.repeat(8)}${creds.apiHash.slice(-4)}` : '未配置'}
+        <LinkRow
+          label="切换 API 凭据"
+          value={
+            creds
+              ? `api_id ${creds.apiId} · ${creds.apiHash.slice(0, 4)}****${creds.apiHash.slice(-4)}`
+              : '未配置'
+          }
+          onPress={() => navigation.navigate('ApiCredentials')}
         />
+        <Text style={styles.paragraph}>
+          这里的 api_id / api_hash 决定客户端以哪个「第三方应用」的身份接入 Telegram。
+          更换后当前会话会失效，需要用手机号重新登录一次。
+        </Text>
       </View>
 
       <View style={styles.card}>

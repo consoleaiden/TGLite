@@ -5,11 +5,14 @@ import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import { bootstrapApp } from './boot';
 import type { RootStackParamList } from './navigation';
+import ApiCredentialsScreen from './screens/ApiCredentialsScreen';
 import ChatInfoScreen from './screens/ChatInfoScreen';
 import ChatListScreen from './screens/ChatListScreen';
 import ChatScreen from './screens/ChatScreen';
 import CodeScreen from './screens/CodeScreen';
+import CommentsScreen from './screens/CommentsScreen';
 import FiltersScreen from './screens/FiltersScreen';
+import ForwardScreen from './screens/ForwardScreen';
 import JoinScreen from './screens/JoinScreen';
 import LoginScreen from './screens/LoginScreen';
 import NetworkScreen from './screens/NetworkScreen';
@@ -64,6 +67,9 @@ export default function RootNavigator() {
             />
             <Stack.Screen name="Filters" component={FiltersScreen} />
             <Stack.Screen name="Network" component={NetworkScreen} />
+            <Stack.Screen name="Forward" component={ForwardScreen} />
+            <Stack.Screen name="Comments" component={CommentsScreen} />
+            <Stack.Screen name="ApiCredentials" component={ApiCredentialsScreen} />
           </>
         ) : (
           <>
