@@ -44,7 +44,8 @@
 - **未成年保护**：本地关键词过滤，命中消息彻底不显示（连折叠提示都不留）
 - **代理配置与官方 App 对齐**：三选一模式（SOCKS5 代理 / MTProto / WEB 代理）。
   SOCKS5 走自研纯 JS 隧道（含 SOCKS4a、HTTP CONNECT，支持用户名密码 / Basic 认证，带连通性自检）；
-  MTProto 走 GramJS 原生 `ConnectionTCPMTProxyAbridged`，支持 hex / dd 前缀 / base64 密钥；
+  MTProto **两种密钥形态都支持**——`dd` / 裸 16 字节走 GramJS 原生 obfuscated2，
+  `ee` + 密钥 + 伪装域名走本项目自己实现的 **fake-TLS**（GramJS 完全没有这条路径，详见 6.3）；
   WEB 代理在界面上标注不支持（详见 6.3）
 - **WebSocket 备用通道**：TCP 被封锁时可切到 MTProto over `wss://<dc>:443/apiws`
 - **登录页也能配代理**：登录页直接显示当前代理状态并一键进入配置，
@@ -155,6 +156,9 @@ cd android && ./gradlew assembleRelease
   - **MTProxy 相关的常驻守卫**（4 项）：MTProxy / WEB 代理都不允许被写进隧道状态；
     `secret` 必须是字符串（用传 Buffer 做**反证**，证明它确实会让 GramJS 抛错）；
     hex / `dd` 前缀 / base64 三种密钥解码后字节数正确
+- **`verify:faketls`** — 起一个严格按官方算法回 ServerHello 的本地桩服务端，
+  让**真正的 GramJS** 用我们接管的 `FakeTlsMTProxyIO` 走完整条 fake-TLS 握手（16 项断言）。
+  因为三个真代理里没有一个能用（见 6.3 的实测结论），只能用桩来验**我们这边**的代码
 
 可选：用环境变量注入凭据后再构建
 
@@ -176,7 +180,9 @@ TGLite/
 ├── scripts/
 │   ├── gen-config.js            # 构建期写入 api_id / api_hash
 │   ├── verify-shims.js          # 自检：哈希 / AES / TCP 适配层
-│   └── verify-transport.js      # 自检：真实代理服务器的端到端隧道验证
+│   ├── verify-transport.js      # 自检：真实代理服务器的端到端隧道验证
+│   ├── verify-faketls-e2e.js    # 自检：fake-TLS 接管链路（本地「官方行为」桩服务端）
+│   └── probe-mtproxy-live.js    # 诊断：拿真实 MTProxy 下最终可用性结论
 ├── .github/workflows/android.yml# CI：typecheck + verify + jest + 编译 + 签名 + 产出 APK
 └── src/
     ├── polyfills.js             # ⭐ 运行前提：Buffer / WebCrypto / 平台判定修正
@@ -193,6 +199,8 @@ TGLite/
     ├── settings.ts              # ⭐ 设置持久化（过滤规则 / 通道 / 代理）
     ├── filters.ts               # ⭐ 关键词过滤纯逻辑（广告 / 未成年）
     ├── net/transport.ts         # ⭐ 传输层门面：把设置变成 GramJS 参数
+    ├── net/mtproxy-faketls.js   # ⭐ fake-TLS 纯逻辑（ClientHello / HMAC / 记录成帧）
+    ├── net/mtproxy-faketls-runtime.js # ⭐ fake-TLS 接管层（换掉 GramJS 的 ObfuscatedIO）
     ├── store.ts                 # zustand 全局状态
     ├── boot.ts                  # 启动恢复 / 登录完成 / 实时消息挂载
     ├── navigation.ts
@@ -262,10 +270,12 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
 | 模式 | 底层实现 | 需要填 | 状态 |
 | --- | --- | --- | --- |
 | **SOCKS5 代理** | 自研纯 JS 隧道 | 服务器 / 端口 /（可选）用户名、密码 | ✅ 可用 |
-| **MTProto** | GramJS 内置 `ConnectionTCPMTProxyAbridged` | 服务器 / 端口 / 密钥 | ✅ 可用 |
+| **MTProto**（`dd` / 裸 16 字节） | GramJS 内置 `ConnectionTCPMTProxyAbridged` | 服务器 / 端口 / 密钥 | ✅ 可用 |
+| **MTProto**（`ee` + 域名） | 本项目自实现的 fake-TLS 传输层 | 服务器 / 端口 / 密钥 | ✅ 可用 |
 | **WEB 代理** | 需要私有 WebView + HTTPS 页面承载 16 字节密钥 | 服务器 / 密钥 | ❌ 本客户端不支持 |
 
-选 SOCKS5 时下方额外出现 `SOCKS5 / SOCKS4 / HTTP` 三个通道芯片（官方只给 SOCKS5，
+两种 MTProto 密钥由 `parseMtproxySecret()` 自动识别，用户只需把服务商给的密钥原样粘进来，
+不需要关心是哪种形态。选 SOCKS5 时下方额外出现 `SOCKS5 / SOCKS4 / HTTP` 三个通道芯片（官方只给 SOCKS5，
 这里多给两档是因为旧代理环境更常见）；切到密钥类模式时会自动清掉用户名密码，反之亦然，
 避免残留字段让校验报莫名其妙的错。
 
@@ -281,9 +291,21 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
 - ⚠️ **WebSocket 通道不支持自建代理**：那条路走的是 OkHttp，插不进我们的隧道。
   设置页对这个组合有显式拦截（保存时提示二选一），`createClient` 里也会把代理置空并给出警告
 
-#### MTProto 代理（走 GramJS 原生能力，不经我们的隧道）
+#### MTProto 代理
 
-这条路径和自建隧道是**两套完全独立的拨号逻辑**，有几个必须踩准的点：
+MTProxy 有两种模式，GramJS **只实现了其中一种**，这是本项目必须自己补一个传输层的原因：
+
+| 模式 | 密钥形态 | GramJS | 本项目 |
+| --- | --- | --- | --- |
+| `obfuscated2` | 32 位 hex / `dd`+16 字节 / 16 字节 base64 | ✅ 原生支持 | 直接交给 GramJS |
+| `fake-TLS` | `ee` + 16 字节密钥 + 伪装域名 | ❌ **完全没有** | ✅ 自己接管传输层 |
+
+判定顺序是**先按 hex 解码、再按 base64 解码，只有「解码后首字节为 `0xee` 且长度 ≥ 17」
+才算 fake-TLS**（`parseMtproxySecret`）。必须是严格判定：有些普通密钥的 base64 串恰好
+以 `ee` 开头（例如 `eeNEgYdJvXrFGRMCIMJdCQ` 解码后只有 16 字节、首字节是 `0x79`），
+宽松地按字符串前缀匹配就会把它误判成 fake-TLS，结果反而彻底连不上。
+
+##### obfuscated2 路径（走 GramJS 原生能力，不经我们的隧道）
 
 - 传参方式是 `new TelegramClient(..., { proxy: { MTProxy: true, ip, port, secret } })`。
   GramJS 会在**构造函数内部**就把 `this._connection` 换成 `ConnectionTCPMTProxyAbridged`，
@@ -297,9 +319,60 @@ APK 构建不会因为 `nitro-modules` / `quick-crypto` 之类的依赖翻车。
   MTProxy 时它**跳过**自己的代理逻辑，直接 `new net.Socket()` 拨号 —— 而此时 `ip`/`port`
   已经被 `TCPMTProxy` 换成了代理服务器地址。如果这时我们的 shim 还留着代理配置，
   就会变成"**用一个代理去连另一个代理**"。`transport-state.js` 对 `mtproxy` 会主动抛错兜底
-- 密钥支持三种写法：32 位 hex（如 `0e45caf3bbce0d8d995cfb919fa9d61a`）、
-  `dd` 开头的 34 位 hex（fake-TLS 形式，`MTProxyIO.initHeader()` 会剥掉前缀），
-  以及解码后为 16 字节的 base64。校验逻辑在 `validateProxySecret()`，纯函数、有边界用例
+
+##### fake-TLS 路径（本项目自己实现）
+
+代码在 `src/net/mtproxy-faketls.js`（纯逻辑）+ `src/net/mtproxy-faketls-runtime.js`（接管层），
+依据是 Telegram 官方 Android 客户端的 JNI 实现（`tgnet/TLSHello.cpp` 生成 ClientHello、
+`tgnet/ConnectionSocket.cpp` 走握手全流程）。三个关键结论：
+
+1. **random 字段（偏移 11..43）不是 obfuscated2 的 64 字节头**，而是
+   「把 hello 的 random 清零后 `HMAC-SHA256(secret16, 整个 hello)`」的 32 字节 ——
+   前 28 字节原样放回，后 4 字节与 unix 时间戳异或
+2. **记录里的 payload 完全不加密**。官方客户端只做 TLS 成帧：
+   首包 `14 03 03 00 01 01 17 03 03 <len16> <payload>`，之后 `17 03 03 <len16> <payload>`，
+   payload 明文直传。加密由 MTProto 自己的 obfuscated2 层负责 ——
+   早期误以为要套 AES-CTR，是错的
+3. **ServerHello 必须校验，且校验时必须先把响应的 11..43 清零**再算 HMAC，
+   否则永远算不出同一个值。不校验这一步，就会把「被代理转发到真实上游的 TLS Alert」
+   误判成握手成功
+
+ClientHello 用「算子 + 嵌套作用域」构造（扩展列表每次随机打乱，padding 补到 517 字节），
+长度字段靠作用域自动回填 —— 手写固定偏移极易错位（本项目就曾因 cipher_suites
+少写 2 字节，导致服务端 `get_sni_domain_info()` 找不到 SNI）。
+
+接管方式是给 GramJS 传一个 `ConnectionTCPMTProxyAbridged` 的**子类**：
+GramJS 内部自己 `new` 那个连接类（我们拿不到实例），但它读的是我们传进去的
+`clientParams.connection`，且写法是 `new this._connection({...})`，
+所以传子类即可，在构造函数里（早于 `_initConn`）把 `ObfuscatedIO` 换成 `FakeTlsMTProxyIO`。
+
+##### 怎么验证
+
+- `npm run verify:faketls` — 起一个本地桩服务端，**严格按官方算法**回 ServerHello，
+  再让真正的 GramJS 走完整条路（16 项断言：两个版本字段、长度自洽、
+  `random == HMAC(secret, 清零 random)`、后握手前缀等）。真代理服务器一个都没验证通过，
+  所以只能用桩来验**我们这边**的代码；这一层绿了，换任何合法 `ee` 代理就应当直接可用
+- `node scripts/probe-mtproxy-live.js` — 拿真实服务器下最终结论。它驱动真实的
+  `MTProtoSender` + `ConnectionTCPMTProxyAbridged`，**以「是否收到 Telegram 服务器自己的
+  错误码」为判据**（收到 `400:` 说明请求真的穿过代理抵达了 DC）。
+  自带直连基线，基线过了才说明探针本身可信
+
+##### 实测结论（2026-10）
+
+| 代理 | 地址 | 结果 |
+| --- | --- | --- |
+| B | `honar.saheledarya.co.uk:8443` | ✅ 可用，走 obfuscated2 |
+| C | `a03.lovely.lat:443` | ✅ 可用，走 obfuscated2 |
+| A | `akenai.tg:853` / `:443` | ❌ **该服务器根本不是 MTProxy** |
+
+A 的判定依据：它对**任意 SNI** 都返回一个合法的 94 字节 ServerHello，但该响应
+11..43 永远不等于 `HMAC(secret, client_random ++ hello)`（50/50 次探测，完全确定性）；
+换成标准 `tls.connect()` 也能握手成功，拿到 `CN=meow-network.com`（Let's Encrypt）证书。
+即它是一台**终止 TLS 的反向代理**，不持有那个密钥。padding 变体（`0x00` / `0x7f`）
+与 hello 变体（紧凑 517B / 完整 ML-KEM ~1800B）都试过，无差别 ——
+**这是服务端的问题，客户端任何改动都修不了**，需要向 A 的运营方索要重新签发的
+可用端点/密钥。
+
 - 设置页的「测试代理」对 MTProto 只做**格式校验**，并如实说明"未做真实握手"——
   真握手需要按密钥派生协议头，这里不假装成功
 - ⚠️ 使用 MTProxy 时官方客户端会提示"该代理可能在你的会话列表里插入赞助频道"，
