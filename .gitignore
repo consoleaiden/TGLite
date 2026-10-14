@@ -85,3 +85,6 @@ android/build/
 *.apk
 *.aab
 src/config.local.ts
+
+# 生成的 Secrets 明文副本（仅供本地复制到 GitHub，绝不入库）
+secrets-out/
