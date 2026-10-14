@@ -7,7 +7,7 @@ import { computeCheck } from 'telegram/Password';
 import { StringSession } from 'telegram/sessions';
 
 import { APP_VERSION, BOOTSTRAP_DC, DIALOG_FETCH_LIMIT, MESSAGE_FETCH_LIMIT } from '../config';
-import { applyTransportSettings, type TransportPlan } from '../net/transport';
+import { applyTransportSettings, makeFakeTlsConnectionClass, type TransportPlan } from '../net/transport';
 import { currentSettings } from '../settings';
 import {
   groupedIdOf,
@@ -165,9 +165,19 @@ export async function createClient(
 
   const session = new StringSession(sessionString);
 
+  // fake-TLS（ee 模式）的接管：
+  // GramJS 内部会自己 new 一个 ConnectionTCPMTProxyAbridged，我们拿不到那个实例，
+  // 但它会把 `connection` 这个参数当构造器用（`new this._connection({...})`），
+  // 所以传一个子类进去就能在**构造完成、连接建立前**把 ObfuscatedIO 换掉。
+  // 见 src/net/mtproxy-faketls-runtime.js 的 attachFakeTlsIO。
+  let connectionImpl: typeof ConnectionTCPObfuscated = ConnectionTCPObfuscated;
+  if (plan.mtproxyFakeTls) {
+    connectionImpl = makeFakeTlsConnectionClass() as typeof ConnectionTCPObfuscated;
+  }
+
   const instance = new TelegramClient(session, creds.apiId, creds.apiHash, {
     // 走 obfuscated2 裸 TCP，与官方客户端同款传输层，抗 DPI 且比明文 TCP 稳
-    connection: ConnectionTCPObfuscated,
+    connection: connectionImpl,
     // 备用通道：MTProto over WebSocket。wss 走系统网络栈，需要 DC 端口为 443。
     networkSocket: plan.networkSocket,
     // MTProxy 专用：GramJS 看到 { MTProxy: true } 会把连接实现换成

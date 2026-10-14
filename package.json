@@ -9,9 +9,10 @@
     "start": "react-native start",
     "test": "jest",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run verify:shims && npm run verify:transport",
+    "verify": "npm run verify:shims && npm run verify:transport && npm run verify:faketls",
     "verify:shims": "node scripts/verify-shims.js",
     "verify:transport": "node scripts/verify-transport.js",
+    "verify:faketls": "node scripts/verify-faketls-e2e.js",
     "config": "node scripts/gen-config.js",
     "apk": "cd android && gradlew assembleRelease"
   },

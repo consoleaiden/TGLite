@@ -48,8 +48,6 @@ async function probe(tag, { proxy, ip = DC4, port = 443, timeoutMs = 18000 }) {
   });
 
   const t0 = Date.now();
-  let tlsDone = false;
-  const origInfo = sender._log && sender._log.info;
   try {
     const ok = await Promise.race([
       sender.connect(conn, false),
@@ -72,10 +70,10 @@ async function probe(tag, { proxy, ip = DC4, port = 443, timeoutMs = 18000 }) {
     // Telegram 服务器返回的错误码 = 请求真的抵达了 DC
     const fromServer = /^\d{3}:/.test(msg);
     if (fromServer) {
-      console.log(`✓ 可用   ${tag.padEnd(22)} 收到 Telegram 应答「${msg.split(' ')[0]}」${Date.now()-t0}ms —— 代理在转发`);
+      console.log(`✓ 可用   ${tag.padEnd(22)} 收到 Telegram 应答「${msg.split(' ')[0]}」${Date.now() - t0}ms —— 代理在转发`);
       return 'ok';
     }
-    console.log(`✗ 不可用 ${tag.padEnd(22)} ${msg}  ${Date.now()-t0}ms`);
+    console.log(`✗ 不可用 ${tag.padEnd(22)} ${msg}  ${Date.now() - t0}ms`);
     return 'dead';
   } finally {
     try { await sender.disconnect(); } catch (_) {}
@@ -93,7 +91,7 @@ async function probe(tag, { proxy, ip = DC4, port = 443, timeoutMs = 18000 }) {
     ['B honar:8443',        { ip: 'honar.saheledarya.co.uk', port: 8443, proxy: mt('honar.saheledarya.co.uk', 'eeNEgYdJvXrFGRMCIMJdCQ') }],
     ['C a03.lovely.lat:443',{ ip: 'a03.lovely.lat', port: 443, proxy: mt('a03.lovely.lat', '68d6a83140657a1c7bf8e64d98ce9432') }],
   ];
-  for (const [tag, opts] of cases) {
+  for (const [, opts] of cases) {
     if (opts.proxy) opts.proxy.port = opts.port;
   }
 

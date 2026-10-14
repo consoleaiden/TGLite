@@ -13,6 +13,7 @@ module.exports = {
         'src/shims/**/*.js',
         'src/polyfills.js',
         'src/net/mtproxy-faketls.js',
+        'src/net/mtproxy-faketls-runtime.js',
         'scripts/**/*.js',
         '__tests__/**/*.ts',
         'metro.config.js',
@@ -22,7 +23,14 @@ module.exports = {
     {
       // fake-TLS 是逐字节拼装 TLS 记录的协议代码，
       // 位运算（掩码、大小端、XOR 时间戳）是它的本意，不是笔误。
-      files: ['src/net/mtproxy-faketls.js', '__tests__/faketls.test.ts'],
+      // 运行时接管层与端到端校验脚本同理（要拆 record 长度字段）。
+      files: [
+        'src/net/mtproxy-faketls.js',
+        'src/net/mtproxy-faketls-runtime.js',
+        '__tests__/faketls.test.ts',
+        '__tests__/faketls-runtime.test.ts',
+        'scripts/verify-faketls-e2e.js',
+      ],
       rules: { 'no-bitwise': 'off' },
     },
     {

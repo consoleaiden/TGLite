@@ -31,10 +31,34 @@ export interface TransportPlan {
   summary: string;
   /** 非致命提示（比如「代理被忽略」），需要显示给用户 */
   warning: string | null;
+  /**
+   * MTProxy 走的是哪条路。faketls 时需要在连接建立后接管 ObfuscatedIO
+   * （见 createTelegramClient 里的 attachFakeTlsIO 调用）。
+   * 非 MTProxy 时是 null。
+   */
+  mtproxyFakeTls: boolean;
 }
 
 export function transportLabel(transport: TransportKind): string {
   return transport === 'wss' ? 'WebSocket (wss 443)' : 'TCP (obfuscated2 443)';
+}
+
+/**
+ * MTProxy 的两种密钥形态，走 GramJS 里两条不同的路径：
+ *
+ *   `dd` / 裸 16 字节  → obfuscated2（GramJS 原生支持，直接传 clientParams.proxy）
+ *   `ee` + 密钥 + 域名 → fake-TLS（GramJS **完全没有**，必须由我们接管 ObfuscatedIO）
+ *
+ * 这里只做判定，真正的接管在 src/net/mtproxy-faketls-runtime.js 里，
+ * 由 createTelegramClient 在拿到 connection 实例后调用 attachFakeTlsIO()。
+ */
+export function mtproxyMode(secret: string): 'faketls' | 'obfuscated2' | 'invalid' {
+  try {
+    const runtime = require('./mtproxy-faketls-runtime');
+    return runtime.isFakeTlsSecret(secret) ? 'faketls' : 'obfuscated2';
+  } catch {
+    return 'invalid';
+  }
 }
 
 /**
@@ -65,6 +89,7 @@ export function applyTransportSettings(
   let warning: string | null = null;
   let proxy: ReturnType<typeof transportState.setProxy> = null;
   let gramjsProxy: unknown;
+  let mtproxyFakeTls = false;
 
   if (setting.enabled) {
     const invalid = validateProxy(setting);
@@ -80,6 +105,14 @@ export function applyTransportSettings(
     } else if (setting.kind === 'mtproxy') {
       // 交给 GramJS；同时清掉 shim 代理，避免两层代理叠加
       transportState.setProxy(null);
+
+      // 两种密钥形态：
+      //   ee + 密钥 + 域名 → fake-TLS，GramJS 完全没有这条路径，稍后由我们接管 IO
+      //   dd / 裸 16 字节  → obfuscated2，GramJS 原生支持
+      // 注意：无论哪种，传给 GramJS 的 secret 都必须是**字符串**（见下面注释）。
+      const mode = mtproxyMode(setting.secret);
+      mtproxyFakeTls = mode === 'faketls';
+
       // 服务商常给 `ee` 开头的「伪 TLS + 域名」拼接串，GramJS 只认 16 字节
       // （或 dd+16），收到拼接串会抛「must be a hex-string representing 16 bytes」。
       // 能识别出 ee 前缀就自动裁出中间 16 字节，识别不出则原样透传，
@@ -115,7 +148,7 @@ export function applyTransportSettings(
   if (proxy) {
     via = `，经 ${proxy.kind.toUpperCase()} 代理 ${proxy.host}:${proxy.port}`;
   } else if (gramjsProxy) {
-    via = `，经 MTProto 代理 ${setting.host.trim()}:${setting.port}`;
+    via = `，经 MTProto 代理 ${setting.host.trim()}:${setting.port}${mtproxyFakeTls ? '（伪 TLS）' : ''}`;
   }
 
   return {
@@ -126,12 +159,29 @@ export function applyTransportSettings(
     useWSS: transport === 'wss',
     summary: `${transportLabel(transport)}${via}`,
     warning,
+    mtproxyFakeTls,
   };
 }
 
 /** 当前生效的代理（不含被忽略的情况） */
 export function activeProxy(): ReturnType<typeof transportState.getProxy> {
   return transportState.getProxy();
+}
+
+/**
+ * 造一个 fake-TLS 版的 MTProxy 连接类，交给 GramJS 的 clientParams.connection。
+ *
+ * GramJS 会在内部自己 new `ConnectionTCPMTProxyAbridged`（见 telegramBaseClient
+ * 里 `if (proxy.MTProxy) this._connection = ConnectionTCPMTProxyAbridged`），
+ * 但它读取的是我们传进去的 clientParams.connection，所以传子类即可接管。
+ *
+ * 这里用 require 而不是顶层 import：`telegram` 的内部路径不属于公开 API，
+ * 放进顶层 import 会让 jest/静态分析把它们当依赖，纯逻辑测试就跑不动了。
+ */
+export function makeFakeTlsConnectionClass(): unknown {
+  const { ConnectionTCPMTProxyAbridged } = require('telegram/network/connection/TCPMTProxy');
+  const runtime = require('./mtproxy-faketls-runtime');
+  return runtime.createFakeTlsConnectionClass(ConnectionTCPMTProxyAbridged);
 }
 
 export interface ProxyTestResult {
