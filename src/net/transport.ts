@@ -11,7 +11,7 @@ import { PromisedNetSockets, PromisedWebSockets } from 'telegram/extensions';
 import * as transportState from '../shims/transport-state';
 import { probeProxy } from '../shims/proxy-probe';
 import type { ProxySetting, Settings, TransportKind } from '../settings';
-import { proxyKindLabel, proxyKindSupported, validateProxy } from '../settings';
+import { extractBareMtproxySecret, proxyKindLabel, proxyKindSupported, validateProxy } from '../settings';
 
 export interface TransportPlan {
   transport: TransportKind;
@@ -80,6 +80,11 @@ export function applyTransportSettings(
     } else if (setting.kind === 'mtproxy') {
       // 交给 GramJS；同时清掉 shim 代理，避免两层代理叠加
       transportState.setProxy(null);
+      // 服务商常给 `ee` 开头的「伪 TLS + 域名」拼接串，GramJS 只认 16 字节
+      // （或 dd+16），收到拼接串会抛「must be a hex-string representing 16 bytes」。
+      // 能识别出 ee 前缀就自动裁出中间 16 字节，识别不出则原样透传，
+      // 让 GramJS 自己报错（它的报错比我们猜的可靠）。
+      const bare = extractBareMtproxySecret(setting.secret);
       gramjsProxy = {
         MTProxy: true,
         ip: setting.host.trim(),
@@ -90,7 +95,7 @@ export function applyTransportSettings(
         // 传 Buffer 会在 new TelegramClient 时抛
         // "proxy.secret.match is not a function"，整个连接建不起来。
         // 它的类型声明也是 `secret: string`。这里只做 trim 后原样交给它。
-        secret: setting.secret.trim(),
+        secret: (bare ?? setting.secret).trim(),
       };
     } else {
       try {

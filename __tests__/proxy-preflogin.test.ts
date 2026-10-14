@@ -13,6 +13,7 @@ import {
   DEFAULT_SETTINGS,
   describePreLoginNetwork,
   describeProxyTarget,
+  extractBareMtproxySecret,
   proxyKindLabel,
   proxyKindSupported,
   proxyNeedsSecret,
@@ -30,6 +31,17 @@ function proxy(overrides: Partial<ProxySetting> = {}): ProxySetting {
 
 /** 图 2/3 里那个真实密钥，用来验证官方那种密钥能被接受 */
 const REAL_SECRET = '0e45caf3bbce0d8d995cfb919fa9d61a';
+
+/**
+ * 现实里服务商给的 `ee` 拼接串（端到端实测可用，能真的从 Telegram 拿回 ResPQ）。
+ * 结构是 ee + 16 字节密钥 + 后面跟域名/填充，GramJS 不认这种格式，
+ * 必须由 extractBareMtproxySecret 裁出中间 16 字节。
+ */
+const EE_SECRET_HEX = 'ee68d6a83140657a1c7bf8e64d98ce9432786170692e6f7a6f6e2e7275';
+const EE_SECRET_HEX_BARE = '68d6a83140657a1c7bf8e64d98ce9432';
+/** 另一个 ee 拼接串样本，用来证明裁剪规则不是给某一个字符串写死的 */
+const EE_SECRET_HEX2 = 'ee54ce330e4690cc297d2b031ff3f288b06d742e616b656e61692e636c69636b';
+const EE_SECRET_HEX2_BARE = '54ce330e4690cc297d2b031ff3f288b0';
 
 describe('describePreLoginNetwork', () => {
   it('未启用代理：直连，并提示去配置', () => {
@@ -187,6 +199,61 @@ describe('validateProxySecret 边界', () => {
 
   it('两端空白会被容忍', () => {
     expect(validateProxySecret(`  ${REAL_SECRET}  `)).toBeNull();
+  });
+});
+
+/**
+ * 现实世界里的 `ee` 拼接串。
+ *
+ * 起因：用户连着给了几个"实测可用"的代理，密钥全是
+ *   ee + <16 字节密钥> + <域名>
+ * 这种拼接形式，直接粘进 GramJS 会抛
+ * 「MTProxy secret must be a hex-string representing 16 bytes」。
+ * 所以要有能力自动裁出中间那 16 字节，否则用户配了也连不上。
+ *
+ * 这里的期望值不是从被测代码反推的，而是先手工解码、再用真实 GramJS
+ * 端到端连过（能从 DC2 拿回 ResPQ）之后定下来的。
+ */
+describe('extractBareMtproxySecret：裁剪 ee 拼接串', () => {
+  it('从 ee 拼接串里裁出中间 16 字节', () => {
+    expect(extractBareMtproxySecret(EE_SECRET_HEX)).toBe(EE_SECRET_HEX_BARE);
+  });
+
+  it('换一个拼接串同样能裁（规则不是给单个字符串写死的）', () => {
+    expect(extractBareMtproxySecret(EE_SECRET_HEX2)).toBe(EE_SECRET_HEX2_BARE);
+  });
+
+  it('裁出来的长度正好 32 位 hex，能直接被 GramJS 接受', () => {
+    const bare = extractBareMtproxySecret(EE_SECRET_HEX);
+    expect(bare).not.toBeNull();
+    expect(bare).toHaveLength(32);
+    // 裁完必须能通过校验，否则 UI 会一边放行一边报错
+    expect(validateProxySecret(bare as string)).toBeNull();
+  });
+
+  it('原本就合法的密钥不会被乱裁', () => {
+    expect(extractBareMtproxySecret(REAL_SECRET)).toBeNull();
+    expect(extractBareMtproxySecret(`dd${REAL_SECRET}`)).toBeNull();
+  });
+
+  it('不认识的形式一律返回 null，绝不猜', () => {
+    // 猜错会得到"格式合法但连不上"的假成功，比直接报错更难排查
+    expect(extractBareMtproxySecret('')).toBeNull();
+    expect(extractBareMtproxySecret('zzzz')).toBeNull();
+    expect(extractBareMtproxySecret('ee')).toBeNull();
+    expect(extractBareMtproxySecret('ee12')).toBeNull();
+  });
+
+  it('ee 开头的 base64 拼接串也能裁', () => {
+    // ee + 16 字节 + 域名，整体做 base64
+    const raw = Buffer.from(EE_SECRET_HEX, 'hex');
+    const b64 = raw.toString('base64');
+    expect(extractBareMtproxySecret(b64)).toBe(EE_SECRET_HEX_BARE);
+  });
+
+  it('ee 拼接串能通过 validateProxy，用户不会再被拦下', () => {
+    expect(validateProxySecret(EE_SECRET_HEX)).toBeNull();
+    expect(validateProxy(proxy({ kind: 'mtproxy', secret: EE_SECRET_HEX, host: 'a03.lovely.lat', port: '853' }))).toBeNull();
   });
 });
 

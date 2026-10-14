@@ -706,6 +706,38 @@ async function main() {
     assert.strictEqual(decodeSecret(b64), false, 'base64 16 字节应通过');
   });
 
+  await check('ee 拼接串能裁出 16 字节裸密钥（实测可用的那串）', () => {
+    // 这是端到端实测过、能从 Telegram DC2 拿回 ResPQ 的真实样本
+    const EE = 'ee68d6a83140657a1c7bf8e64d98ce9432786170692e6f7a6f6e2e7275';
+    const EXPECTED = '68d6a83140657a1c7bf8e64d98ce9432';
+
+    // 与 src/settings.ts 的 extractBareMtproxySecret 保持同一套判据
+    const extract = (secret) => {
+      const trimmed = (secret || '').trim();
+      const isHex = /^[0-9a-fA-F]+$/.test(trimmed);
+      if (!isHex) {
+        try {
+          const b = Buffer.from(trimmed, 'base64');
+          if (b.length >= 17 && b[0] === 0xee) return Buffer.from(b.subarray(1, 17)).toString('hex');
+        } catch { /* 非 base64 */ }
+        return null;
+      }
+      if (trimmed.length % 2 !== 0 || trimmed.length < 34) return null;
+      const b = Buffer.from(trimmed, 'hex');
+      if (b.length >= 17 && b[0] === 0xee) return Buffer.from(b.subarray(1, 17)).toString('hex');
+      return null;
+    };
+
+    assert.strictEqual(extract(EE), EXPECTED, 'ee 拼接串应裁出中间 16 字节');
+    // 裁出来的必须是 GramJS 肯接受的 16 字节形式
+    assert.strictEqual(Buffer.from(EXPECTED, 'hex').length, 16, '裁出的密钥应为 16 字节');
+    // 反证：原始拼接串解出来是 29 字节，GramJS 必然拒绝
+    assert.strictEqual(Buffer.from(EE, 'hex').length, 29, '原始拼接串应为 29 字节（GramJS 不接受）');
+    // 合法密钥不该被乱裁
+    assert.strictEqual(extract('0e45caf3bbce0d8d995cfb919fa9d61a'), null, '32 位裸密钥不应被裁');
+    assert.strictEqual(extract('ddee54ce330e4690cc297d2b031ff3f288'), null, 'dd 形式不应被裁');
+  });
+
   // ---------------------------------------------------------------------
   // 收尾
   // ---------------------------------------------------------------------

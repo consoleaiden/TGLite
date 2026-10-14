@@ -233,6 +233,48 @@ export function validateProxy(proxy: ProxySetting): string | null {
  * 所以这里不做「必须是 32 位」的死校验，只要求长度合理且是合法 hex/base64，
  * 真正的格式问题交给 GramJS 在连接时报错（它自己会判 byte 长度）。
  */
+/**
+ * 把 `ee` 开头的「伪 TLS + 域名」密钥拆出可用的 16 字节裸密钥。
+ *
+ * 现实里很多机场/代理服务商给的是这种拼接串（实测多个样本都是）：
+ *   ee | <16 字节密钥> | [后面跟若干字节的域名/填充]
+ * GramJS 只认 16 字节或 `dd`+16 字节，收到这种串会直接抛
+ * 「MTProxy secret must be a hex-string representing 16 bytes」。
+ *
+ * 这里做**保守**处理：只在能明确识别出 `ee` 前缀、且总长度 ≥ 17 字节时才裁，
+ * 返回中间的 16 字节 hex。识别不出来就返回 null，交给校验逻辑去报错，
+ * 绝不猜——猜错会得到一个"格式合法但连不上"的假成功。
+ *
+ * 注意：裁出来的裸密钥**没有 SNI 伪装**，抗阻断能力弱于 `dd` 形式。
+ * 所以这只是让用户在只拿到拼接串时有个能用起来的办法，
+ * 更推荐向服务商索取 32 位十六进制的原始密钥。
+ */
+export function extractBareMtproxySecret(secret: string): string | null {
+  const trimmed = (secret || '').trim();
+  if (!/^[0-9a-fA-F]+$/.test(trimmed)) {
+    // base64 形式：解出来看首字节是不是 ee
+    try {
+      const bytes = Buffer.from(trimmed, 'base64');
+      if (bytes.length >= 17 && bytes[0] === 0xee) {
+        // 注意：Buffer.slice()/subarray() 的返回类型被声明成 Uint8Array，
+        // 会丢掉 Buffer.toString(encoding) 那个重载，tsc 报 "Expected 0 arguments"。
+        // 所以这里用 Buffer.from(子区间) 显式拿回 Buffer 类型。
+        return Buffer.from(bytes.subarray(1, 17)).toString('hex');
+      }
+    } catch {
+      /* 不是合法 base64，交给调用方报错 */
+    }
+    return null;
+  }
+  // hex 形式：必须偶数长度才能解
+  if (trimmed.length % 2 !== 0 || trimmed.length < 34) return null;
+  const bytes = Buffer.from(trimmed, 'hex');
+  if (bytes.length >= 17 && bytes[0] === 0xee) {
+    return Buffer.from(bytes.subarray(1, 17)).toString('hex');
+  }
+  return null;
+}
+
 export function validateProxySecret(secret: string, kind: ProxyKind = 'mtproxy'): string | null {
   const trimmed = (secret || '').trim();
   const label = kind === 'web' ? '密钥' : '密钥';
@@ -244,10 +286,14 @@ export function validateProxySecret(secret: string, kind: ProxyKind = 'mtproxy')
   const isHex = /^[0-9a-fA-F]+$/.test(trimmed);
   if (isHex) {
     // dd + 32 位 = 34；纯 32 位 = 32。允许两者。
-    if (trimmed.length !== 32 && trimmed.length !== 34) {
-      return '密钥格式不对：十六进制密钥应为 32 位（或 dd 开头的 34 位）。';
-    }
-    return null;
+    if (trimmed.length === 32 || trimmed.length === 34) return null;
+
+    // `ee` 开头的「伪 TLS + 域名」拼接串。实测多个服务商都发这种格式，
+    // 连接时会由 extractBareMtproxySecret 自动裁出 16 字节裸密钥，
+    // 所以这里放行，不拦用户。
+    if (extractBareMtproxySecret(trimmed)) return null;
+
+    return '密钥格式不对：十六进制密钥应为 32 位（或 dd 开头的 34 位、ee 开头的拼接串）。';
   }
   // 非 hex 就按 base64 看：16 字节 base64 通常是 24 字符（含 1 个 '='）
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed)) {
@@ -256,6 +302,8 @@ export function validateProxySecret(secret: string, kind: ProxyKind = 'mtproxy')
   try {
     const bytes = Buffer.from(trimmed, 'base64');
     if (bytes.length !== 16 && bytes.length !== 17) {
+      // ee 开头的 base64 拼接串也放行（同样走自动裁剪）
+      if (extractBareMtproxySecret(trimmed)) return null;
       return '密钥长度不对：解码后应为 16 字节。';
     }
   } catch {
